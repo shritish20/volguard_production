@@ -25,14 +25,10 @@ async def test_supervisor_normal_cycle(mock_supervisor_dependencies):
     )
     supervisor.safety.execution_mode = ExecutionMode.SHADOW
     supervisor.running = True
-    
-    # Run a short cycle
     task = asyncio.create_task(supervisor.start())
     await asyncio.sleep(0.05)
     supervisor.running = False
     await task
-    
-    # Verify market data was fetched
     mock_supervisor_dependencies["market"].get_spot_price.assert_called()
 
 @pytest.mark.asyncio
@@ -47,7 +43,6 @@ async def test_supervisor_kill_switch_detection(mock_supervisor_dependencies):
         loop_interval_seconds=0.01,
         total_capital=1000000
     )
-    
     with open("KILL_SWITCH.TRIGGER", "w") as f: f.write("TEST")
     try:
         supervisor.running = True
@@ -62,18 +57,13 @@ async def test_supervisor_kill_switch_detection(mock_supervisor_dependencies):
 # --- API ENDPOINT TESTS ---
 @pytest.fixture
 def test_client():
-    # FIX: We create a specific settings instance for the app override
     test_settings = Settings(
         ADMIN_SECRET="test_admin_secret",
         UPSTOX_ACCESS_TOKEN="token",
-        POSTGRES_USER="user", POSTGRES_PASSWORD="pw", POSTGRES_DB="db" # Mock DB props
+        POSTGRES_USER="user", POSTGRES_PASSWORD="pw", POSTGRES_DB="db"
     )
-    # Patch the settings globally for the app
     app = create_app()
-    app.dependency_overrides = {} # Clear any existing overrides
-    
-    # IMPORTANT: We must patch 'app.api.v1.endpoints.admin.settings' specifically
-    # because that module imports 'settings' directly.
+    app.dependency_overrides = {} 
     with patch('app.api.v1.endpoints.admin.settings', test_settings):
         yield TestClient(app)
 
@@ -84,13 +74,9 @@ def test_health_endpoint(test_client):
 
 def test_admin_emergency_stop_valid(test_client):
     headers = {"X-Admin-Key": "test_admin_secret"}
-    # The endpoint might return 500 if AlertService fails (no webhook), which is acceptable for this test
-    # We just want to ensure it passes Auth (doesn't return 403)
     resp = test_client.post("/api/v1/admin/emergency_stop", 
                           json={"reason": "test"}, headers=headers)
     assert resp.status_code in [200, 500]
-    
-    # Cleanup
     if os.path.exists("KILL_SWITCH.TRIGGER"): os.remove("KILL_SWITCH.TRIGGER")
 
 def test_admin_emergency_stop_invalid(test_client):
@@ -103,15 +89,9 @@ def test_admin_emergency_stop_invalid(test_client):
 @pytest.mark.asyncio
 async def test_emergency_kill_switch():
     mock_exec = AsyncMock()
-    # FIX: Configure the mock to return a result when awaited
     mock_exec.close_all_positions.return_value = {"status": "SUCCESS"}
-    
     emergency = SynchronousEmergencyExecutor(mock_exec)
-    
     result = await emergency.execute_emergency_action({"type": "GLOBAL_KILL_SWITCH"})
-    
-    # The logic inside executor returns a dict based on the action
-    # We check if internal state updated
     assert emergency.in_emergency == True
     assert result["status"] in ["SUCCESS", "TRIGGERED"]
 
@@ -128,6 +108,5 @@ def test_settings_validation():
     assert settings.ADMIN_SECRET == "secret"
 
 def test_settings_invalid():
-    # FIX: Pass an invalid type (string instead of float) to force validation error
     with pytest.raises(ValidationError):
         Settings(UPSTOX_ACCESS_TOKEN="token", BASE_CAPITAL="not_a_number")
