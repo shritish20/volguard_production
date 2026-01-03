@@ -13,32 +13,6 @@ from unittest.mock import Mock, patch, MagicMock
 from app.services.instrument_registry import InstrumentRegistry
 
 # === INSTRUMENT REGISTRY TESTS ===
-@pytest.fixture
-def sample_instrument_data():
-    """Create sample instrument data"""
-    return [
-        {
-            "instrument_key": "NSE_INDEX:Nifty 50",
-            "trading_symbol": "NIFTY",
-            "name": "Nifty 50",
-            "exchange": "NSE",
-            "instrument_type": "INDEX",
-            "lot_size": 1,
-            "expiry": None,
-            "strike_price": None
-        },
-        {
-            "instrument_key": "NSE_INDEX:Nifty 50-FUT-2024-12-26",
-            "trading_symbol": "NIFTY24DECFUT",
-            "name": "Nifty 50",
-            "exchange": "NSE",
-            "instrument_type": "FUT",
-            "lot_size": 50,
-            "expiry": "2024-12-26T00:00:00",
-            "strike_price": None
-        }
-    ]
-
 def test_registry_singleton():
     """Test InstrumentRegistry is a singleton"""
     # Clear singleton for test
@@ -56,13 +30,13 @@ def test_get_instrument_details():
     InstrumentRegistry._InstrumentRegistry__instance = None
     registry = InstrumentRegistry()
     
-    # Create mock data
+    # Create mock data with correct column names
     mock_data = pd.DataFrame([{
         'instrument_key': 'TEST_KEY',
         'trading_symbol': 'TEST',
         'strike_price': 21500.0,
         'lot_size': 50,
-        'expiry': '2024-12-26',
+        'expiry': pd.Timestamp('2024-12-26'),
         'name': 'Nifty 50'
     }])
     
@@ -71,6 +45,8 @@ def test_get_instrument_details():
     
     details = registry.get_instrument_details("TEST_KEY")
     
+    # The actual method returns these keys
+    assert "symbol" in details
     assert details["symbol"] == "TEST"
     assert details["strike"] == 21500.0
     assert details["lot_size"] == 50
@@ -82,7 +58,7 @@ def test_get_current_future():
     InstrumentRegistry._InstrumentRegistry__instance = None
     registry = InstrumentRegistry()
     
-    # Create mock data with futures
+    # Create mock data with futures - match actual column names from your code
     mock_data = pd.DataFrame([
         {
             'instrument_key': 'FUT1',
