@@ -1,25 +1,53 @@
+# run_production.py
+
 import asyncio
 import logging
 import subprocess
 import sys
-# NOTE: We do NOT import app.config here to prevent loading old env vars
+import signal
+import os
+import time
 
-# Configure JSON Logging for Production
 from app.utils.logging import setup_logging
 logger = setup_logging()
 
-async def main():
-    # --- 1. AUTO LOGIN SEQUENCE ---
-    logger.info("🔐 Running Token Manager...")
-    try:
-        # Run script to refresh token in .env
-        subprocess.run([sys.executable, "scripts/token_manager.py"], check=False)
-        logger.info("Token refresh sequence complete.")
-    except Exception as e:
-        logger.warning(f"⚠️ Token Manager issue: {e}")
+_shutdown = False
 
-    # --- 2. DELAYED IMPORTS (Critical for Auto-Login) ---
-    # We import these NOW so they pick up the fresh .env values
+
+def _handle_shutdown(sig, frame):
+    global _shutdown
+    logger.warning(f"Received shutdown signal ({sig}). Preparing graceful exit...")
+    _shutdown = True
+
+
+# Register signal handlers (Docker / K8s safe)
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
+
+
+async def main():
+    # ======================================================
+    # 1. TOKEN REFRESH (STRICT)
+    # ======================================================
+    logger.info("🔐 Running token refresh sequence...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "scripts/token_manager.py"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error("❌ Token refresh script failed.")
+            logger.error(result.stderr)
+            return
+        logger.info("✅ Token refresh completed.")
+    except Exception as e:
+        logger.critical(f"❌ Token manager execution failed: {e}")
+        return
+
+    # ======================================================
+    # 2. DELAYED IMPORTS (MANDATORY)
+    # ======================================================
     from app.config import settings
     from app.database import init_db
     from app.lifecycle.supervisor import ProductionTradingSupervisor
@@ -31,40 +59,61 @@ async def main():
     from app.core.market.websocket_client import UpstoxFeedService
     from app.lifecycle.safety_controller import ExecutionMode
 
-    logger.info(f"Booting VolGuard: {settings.PROJECT_NAME} (Env: {settings.ENVIRONMENT})")
+    logger.info(
+        f"🚀 Booting {settings.PROJECT_NAME} | Env={settings.ENVIRONMENT}"
+    )
 
-    # --- 3. Initialize Database ---
-    logger.info("Initializing Database...")
+    # ======================================================
+    # 3. DATABASE INIT
+    # ======================================================
+    logger.info("📦 Initializing database...")
     await init_db()
 
-    # --- 4. Initialize Clients ---
+    # ======================================================
+    # 4. MARKET CLIENT
+    # ======================================================
     market = MarketDataClient(
         settings.UPSTOX_ACCESS_TOKEN,
         settings.UPSTOX_BASE_V2,
-        settings.UPSTOX_BASE_V3
+        settings.UPSTOX_BASE_V3,
     )
 
-    # Validate Token immediately
+    # Hard token validation
     try:
-        await market.get_spot_price()
-        logger.info("✅ Upstox Token Validated.")
-    except Exception:
-        logger.critical("❌ UPSTOX TOKEN INVALID. Bot cannot start.")
+        price = await market.get_spot_price()
+        if price <= 0:
+            raise RuntimeError("Spot price invalid")
+        logger.info("✅ Upstox token validated.")
+    except Exception as e:
+        logger.critical(f"❌ Upstox token invalid: {e}")
         return
 
-    # --- 5. Initialize Engines ---
-    config_dict = settings.model_dump()
-    risk = RiskEngine(config_dict)
-    adj = AdjustmentEngine(config_dict)
-    executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
-    engine = TradingEngine(market, config_dict)
+    # ======================================================
+    # 5. ENGINE INITIALIZATION
+    # ======================================================
+    config = settings.model_dump()
 
-    # --- 6. WebSocket Service ---
+    risk = RiskEngine(config)
+    adj = AdjustmentEngine(config)
+    executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
+    engine = TradingEngine(market, config)
+
+    # ======================================================
+    # 6. WEBSOCKET (OPTIONAL, GUARDED)
+    # ======================================================
     ws = None
     if settings.SUPERVISOR_WEBSOCKET_ENABLED:
-        ws = UpstoxFeedService(settings.UPSTOX_ACCESS_TOKEN)
+        try:
+            ws = UpstoxFeedService(settings.UPSTOX_ACCESS_TOKEN)
+            await ws.connect()
+            logger.info("📡 WebSocket connected.")
+        except Exception as e:
+            logger.error(f"WebSocket disabled due to error: {e}")
+            ws = None
 
-    # --- 7. Initialize Supervisor ---
+    # ======================================================
+    # 7. SUPERVISOR
+    # ======================================================
     sup = ProductionTradingSupervisor(
         market_client=market,
         risk_engine=risk,
@@ -73,30 +122,38 @@ async def main():
         trading_engine=engine,
         websocket_service=ws,
         loop_interval_seconds=settings.SUPERVISOR_LOOP_INTERVAL,
-        total_capital=settings.BASE_CAPITAL
+        total_capital=settings.BASE_CAPITAL,
     )
 
-    # --- 8. Set Execution Mode ---
+    # Execution Mode
     if settings.ENVIRONMENT == "production_live":
-        logger.warning("⚠️ SYSTEM STARTING IN FULL_AUTO MODE - REAL MONEY AT RISK ⚠️")
+        logger.warning("⚠️ FULL_AUTO MODE (REAL MONEY)")
         sup.safety.execution_mode = ExecutionMode.FULL_AUTO
     elif settings.ENVIRONMENT == "production_semi":
-        logger.info("System starting in SEMI_AUTO mode - Approvals Required")
+        logger.info("SEMI_AUTO MODE (Approvals Required)")
         sup.safety.execution_mode = ExecutionMode.SEMI_AUTO
     else:
-        logger.info("System starting in SHADOW mode (Safety Default)")
+        logger.info("SHADOW MODE (Default)")
         sup.safety.execution_mode = ExecutionMode.SHADOW
 
-    # --- 9. Start the Loop ---
+    # ======================================================
+    # 8. RUN LOOP (AUTO-RESTART)
+    # ======================================================
+    logger.info("🧠 Supervisor started.")
+
     try:
-        await sup.start()
-    except KeyboardInterrupt:
-        logger.info("Shutdown signal received.")
-    except Exception as e:
-        logger.critical(f"Fatal Startup Error: {e}", exc_info=True)
+        while not _shutdown:
+            try:
+                await sup.start()
+            except Exception as e:
+                logger.critical("Supervisor crashed. Restarting in 5s.", exc_info=True)
+                await asyncio.sleep(5)
     finally:
+        logger.info("🛑 Shutting down gracefully...")
         await market.close()
-        if ws: await ws.disconnect()
+        if ws:
+            await ws.disconnect()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
