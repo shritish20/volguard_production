@@ -1,47 +1,48 @@
-# app/core/trading/executor.py
-
 import requests
 import logging
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
 from app.database import AsyncSessionLocal, TradeRecord
 from app.services.instrument_registry import registry
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-HFT_BASE = "https://api-hft.upstox.com"
-API_BASE = "https://api.upstox.com"
+# -------------------------------
+# BASE URLS
+# -------------------------------
+BASE_HFT = "https://api-hft.upstox.com/v3"
+BASE_V2  = "https://api.upstox.com/v2"
+
+ALGO_NAME = "VolGuard"
 
 
 class TradeExecutor:
     """
-    REST-only Upstox Executor
-    Aligned 100% with official Upstox v2 / v3 endpoints
+    REST-only Upstox Trade Executor
+    Fully aligned with v2 / v3 official endpoints
     """
 
     def __init__(self, access_token: str):
         self.headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-Algo-Name": ALGO_NAME
         }
 
-    # ------------------------------------------------
-    # POSITIONS
-    # ------------------------------------------------
+    # ==========================================================
+    # POSITIONS (v2)
+    # ==========================================================
     async def get_positions(self) -> List[Dict]:
-        """
-        GET /v2/portfolio/short-term-positions
-        """
-        url = f"{API_BASE}/v2/portfolio/short-term-positions"
+        url = f"{BASE_V2}/portfolio/short-term-positions"
 
         try:
             resp = requests.get(url, headers=self.headers, timeout=5)
             resp.raise_for_status()
-            data = resp.json().get("data", [])
 
+            data = resp.json().get("data", [])
             positions = []
+
             for p in data:
                 if p.get("quantity", 0) == 0:
                     continue
@@ -52,14 +53,14 @@ class TradeExecutor:
                     "position_id": p["instrument_token"],
                     "instrument_key": p["instrument_token"],
                     "symbol": p.get("trading_symbol"),
-                    "quantity": int(p["quantity"]),
+                    "quantity": abs(int(p["quantity"])),
                     "side": "BUY" if int(p["quantity"]) > 0 else "SELL",
-                    "average_price": float(p.get("average_price", 0)),
+                    "average_price": float(p.get("buy_price") or p.get("sell_price") or 0),
                     "current_price": float(p.get("last_price", 0)),
                     "pnl": float(p.get("pnl", 0)),
                     "strike": details.get("strike"),
                     "expiry": details.get("expiry"),
-                    "lot_size": details.get("lot_size", 0),
+                    "lot_size": details.get("lot_size", 50),
                     "option_type": "CE" if "CE" in p.get("trading_symbol", "") else "PE"
                 })
 
@@ -69,67 +70,47 @@ class TradeExecutor:
             logger.error(f"Position fetch failed: {e}")
             return []
 
-    # ------------------------------------------------
-    # LTP (for limit protection)
-    # ------------------------------------------------
-    def _get_ltp(self, instrument_key: str) -> float:
-        url = f"{API_BASE}/v3/market-quote/ltp"
-        try:
-            resp = requests.get(
-                url,
-                headers=self.headers,
-                params={"instrument_key": instrument_key},
-                timeout=3
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            return float(next(iter(data.values()))["last_price"])
-        except Exception:
-            return 0.0
+    # ==========================================================
+    # PLACE ORDER (v3)
+    # ==========================================================
+    async def execute_adjustment(self, adj: Dict) -> Dict:
+        instrument = adj["instrument_key"]
 
-    # ------------------------------------------------
-    # PLACE ORDER
-    # ------------------------------------------------
-    async def execute_adjustment(self, adjustment: Dict) -> Dict:
-        """
-        POST /v3/order/place
-        """
-        url = f"{HFT_BASE}/v3/order/place"
+        # Resolve dynamic future
+        if instrument == "NIFTY_FUT_CURRENT":
+            instrument = registry.get_current_future("NIFTY")
+            if not instrument:
+                return {"status": "FAILED", "reason": "Future not found"}
 
-        instrument_key = adjustment["instrument_key"]
-        qty = abs(int(adjustment["quantity"]))
-        side = adjustment["side"]
-
-        ltp = self._get_ltp(instrument_key)
-
-        order_type = "MARKET"
-        price = 0.0
-
-        if ltp > 0:
-            order_type = "LIMIT"
-            price = round(ltp * (1.05 if side == "BUY" else 0.95), 2)
+        qty  = int(adj["quantity"])
+        side = adj["side"]
 
         payload = {
             "quantity": qty,
             "product": "D",
             "validity": "DAY",
-            "price": price,
-            "instrument_token": instrument_key,
-            "order_type": order_type,
+            "price": 0,
+            "tag": ALGO_NAME,
+            "instrument_token": instrument,
+            "order_type": "MARKET",
             "transaction_type": side,
             "disclosed_quantity": 0,
-            "trigger_price": 0.0,
+            "trigger_price": 0,
             "is_amo": False,
-            "slice": True,
-            "tag": "VolGuard_Auto"
+            "slice": True
         }
 
         try:
-            resp = requests.post(url, headers=self.headers, json=payload, timeout=5)
+            resp = requests.post(
+                f"{BASE_HFT}/order/place",
+                headers=self.headers,
+                json=payload,
+                timeout=5
+            )
             resp.raise_for_status()
-            order_id = resp.json()["data"]["order_id"]
 
-            await self._persist_trade(order_id, instrument_key, qty, side, adjustment)
+            order_id = resp.json()["data"]["order_id"]
+            await self._persist_trade(order_id, instrument, qty, side, adj.get("strategy"))
 
             return {"status": "SUCCESS", "order_id": order_id}
 
@@ -137,42 +118,74 @@ class TradeExecutor:
             logger.error(f"Order placement failed: {e}")
             return {"status": "FAILED", "error": str(e)}
 
-    # ------------------------------------------------
-    # EXIT ALL POSITIONS
-    # ------------------------------------------------
+    # ==========================================================
+    # MODIFY ORDER (v3)
+    # ==========================================================
+    def modify_order(self, order_id: str, price: float, qty: int):
+        payload = {
+            "order_id": order_id,
+            "price": round(price, 2),
+            "quantity": qty,
+            "validity": "DAY",
+            "order_type": "LIMIT",
+            "disclosed_quantity": 0,
+            "trigger_price": 0
+        }
+
+        return requests.put(
+            f"{BASE_HFT}/order/modify",
+            headers=self.headers,
+            json=payload,
+            timeout=5
+        ).json()
+
+    # ==========================================================
+    # CANCEL ORDER (v3)
+    # ==========================================================
+    def cancel_order(self, order_id: str):
+        return requests.delete(
+            f"{BASE_HFT}/order/cancel",
+            headers=self.headers,
+            params={"order_id": order_id},
+            timeout=5
+        ).json()
+
+    # ==========================================================
+    # EXIT ALL POSITIONS (v2)
+    # ==========================================================
     async def close_all_positions(self, reason: str):
-        """
-        POST /v2/order/positions/exit
-        """
-        url = f"{API_BASE}/v2/order/positions/exit"
+        logger.critical(f"CLOSING ALL POSITIONS: {reason}")
 
         try:
-            resp = requests.post(url, headers=self.headers, json={}, timeout=5)
-            resp.raise_for_status()
-            logger.critical(f"GLOBAL EXIT triggered: {reason}")
+            requests.post(
+                f"{BASE_V2}/order/positions/exit",
+                headers=self.headers,
+                json={},
+                timeout=6
+            )
         except Exception as e:
-            logger.critical(f"GLOBAL EXIT FAILED: {e}")
+            logger.critical(f"FORCED EXIT FAILED: {e}")
 
-    # ------------------------------------------------
-    # DB PERSISTENCE
-    # ------------------------------------------------
-    async def _persist_trade(self, order_id, token, qty, side, adjustment):
+    # ==========================================================
+    # PERSISTENCE
+    # ==========================================================
+    async def _persist_trade(self, order_id, token, qty, side, strategy):
         try:
             details = registry.get_instrument_details(token)
             async with AsyncSessionLocal() as session:
-                trade = TradeRecord(
-                    id=str(uuid.uuid4()),
-                    trade_tag=order_id,
-                    instrument_key=token,
-                    quantity=qty,
-                    side=side,
-                    strategy=adjustment.get("strategy", "AUTO"),
-                    strike=details.get("strike"),
-                    expiry=details.get("expiry"),
-                    lot_size=details.get("lot_size"),
-                    reason=adjustment.get("reason")
+                session.add(
+                    TradeRecord(
+                        id=str(uuid.uuid4()),
+                        trade_tag=order_id,
+                        instrument_key=token,
+                        quantity=qty,
+                        side=side,
+                        strategy=strategy or "AUTO",
+                        strike=details.get("strike"),
+                        expiry=details.get("expiry"),
+                        lot_size=details.get("lot_size")
+                    )
                 )
-                session.add(trade)
                 await session.commit()
         except Exception as e:
             logger.error(f"Trade persistence failed: {e}")
