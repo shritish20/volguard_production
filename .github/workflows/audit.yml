@@ -1,0 +1,56 @@
+name: VolGuard Production Audit
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  audit_and_test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: volguard
+          POSTGRES_PASSWORD: volguard_secure
+          POSTGRES_DB: volguard_production
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+
+    - name: Create Fake .env
+      run: |
+        echo "ADMIN_SECRET=test_secret" >> .env
+        echo "UPSTOX_ACCESS_TOKEN=test_token" >> .env
+        echo "ENVIRONMENT=test" >> .env
+        echo "POSTGRES_SERVER=localhost" >> .env
+        echo "POSTGRES_PASSWORD=volguard_secure" >> .env
+
+    - name: Run Tests
+      env:
+        POSTGRES_SERVER: localhost
+        REDIS_URL: redis://localhost:6379
+        ADMIN_SECRET: test_secret
+        UPSTOX_ACCESS_TOKEN: test_token
+      run: |
+        python -m pytest tests/ -v --tb=short
