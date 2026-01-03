@@ -10,6 +10,8 @@ class TradingEngine:
     def __init__(self, market_client, config: Dict):
         self.market = market_client
         self.config = config
+        # FIX: Restored base_capital to satisfy tests
+        self.base_capital = config.get("BASE_CAPITAL", 1000000)
         self.lot_size = config.get("MAX_POSITION_SIZE", 50) # Default to Nifty Lot
         
         # Strategy Parameters
