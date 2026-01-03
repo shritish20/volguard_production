@@ -1,185 +1,218 @@
-# app/core/market/data_client.py
-
 import httpx
 import pandas as pd
 from datetime import date, timedelta, datetime
 from urllib.parse import quote
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 import logging
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 logger = logging.getLogger(__name__)
 
+# -------------------------------
+# Instrument Keys
+# -------------------------------
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
-VIX_KEY = "NSE_INDEX|India VIX"
+VIX_KEY   = "NSE_INDEX|India VIX"
 
-
+# -------------------------------
+# Market Data Client (REST ONLY)
+# -------------------------------
 class MarketDataClient:
     """
-    Single source of market truth.
-    This class MUST fail fast on bad data.
+    Upstox REST-only Market Data Client
+    - v2: Option Chain, Contracts
+    - v3: LTP, Historical Candles
     """
 
     def __init__(self, access_token: str, base_url_v2: str, base_url_v3: str):
         self.headers = {
             "Authorization": f"Bearer {access_token}",
-            "accept": "application/json",
-            "Api-Version": "2.0",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
-        self.base_v2 = base_url_v2
-        self.base_v3 = base_url_v3
-        self.client = httpx.AsyncClient(headers=self.headers, timeout=5.0)
+        self.base_v2 = base_url_v2.rstrip("/")
+        self.base_v3 = base_url_v3.rstrip("/")
+        self.client = httpx.AsyncClient(headers=self.headers, timeout=6.0)
 
     async def close(self):
         await self.client.aclose()
 
-    # ======================================================
-    # HISTORICAL DATA
-    # ======================================================
-    @retry(stop=stop_after_attempt(2), wait=wait_fixed(0.5))
-    async def get_history(self, key: str, days: int = 400) -> pd.DataFrame:
-        edu = quote(key, safe="")
-        td = date.today().strftime("%Y-%m-%d")
-        fd = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-        url = f"{self.base_v2}/historical-candle/{edu}/day/{td}/{fd}"
-
-        resp = await self.client.get(url)
-        resp.raise_for_status()
-
-        data = resp.json().get("data", {}).get("candles", [])
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(
-            data,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "oi"],
-        )
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df.set_index("timestamp", inplace=True)
-
-        return df.astype(float).sort_index()
-
-    # ======================================================
-    # LIVE QUOTES
-    # ======================================================
+    # ==========================================================
+    # LTP (v3)
+    # ==========================================================
     @retry(stop=stop_after_attempt(2), wait=wait_fixed(0.5))
     async def get_live_quote(self, keys: List[str]) -> Dict[str, float]:
         if not keys:
             return {}
 
+        encoded = ",".join(keys)
         url = f"{self.base_v3}/market-quote/ltp"
-        resp = await self.client.get(url, params={"instrument_key": ",".join(keys)})
+
+        resp = await self.client.get(url, params={"instrument_key": encoded})
         resp.raise_for_status()
 
         data = resp.json().get("data", {})
-        results = {}
-
-        for k, details in data.items():
-            clean_key = k.replace(":", "").strip()
-            results[clean_key] = details.get("last_price", 0.0)
-
-        return results
+        return {
+            k.replace(":", ""): v.get("last_price", 0.0)
+            for k, v in data.items()
+        }
 
     async def get_spot_price(self) -> float:
         try:
             q = await self.get_live_quote([NIFTY_KEY])
-            return q.get(NIFTY_KEY, 0.0)
+            return float(q.get(NIFTY_KEY, 0.0))
         except Exception:
             return 0.0
 
     async def get_vix(self) -> float:
         try:
             q = await self.get_live_quote([VIX_KEY])
-            return q.get(VIX_KEY, 0.0)
+            return float(q.get(VIX_KEY, 0.0))
         except Exception:
             return 0.0
 
-    # ======================================================
-    # OPTION CHAIN
-    # ======================================================
-    async def get_option_chain(self, expiry_date: str) -> pd.DataFrame:
-        url = f"{self.base_v2}/option/chain"
-        resp = await self.client.get(
-            url, params={"instrument_key": NIFTY_KEY, "expiry_date": expiry_date}
-        )
+    # ==========================================================
+    # FAST CANDLES (v3) – 5 MIN / INTRADAY
+    # ==========================================================
+    @retry(stop=stop_after_attempt(2), wait=wait_fixed(0.5))
+    async def get_intraday_candles(
+        self,
+        instrument_key: str,
+        interval_minutes: int = 5
+    ) -> pd.DataFrame:
+        """
+        FAST analytics:
+        - RV
+        - Parkinson
+        - Short-term vol spike
+        """
+
+        encoded = quote(instrument_key, safe="")
+        url = f"{self.base_v3}/historical-candle/{encoded}/minutes/{interval_minutes}"
+
+        today = date.today().strftime("%Y-%m-%d")
+        yesterday = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        full_url = f"{url}/{today}/{yesterday}"
+
+        resp = await self.client.get(full_url)
         resp.raise_for_status()
 
-        data = resp.json().get("data", [])
-        if not data:
-            return pd.DataFrame()
+        candles = resp.json().get("data", {}).get("candles", [])
+        return self._to_df(candles)
 
-        rows = []
+    # ==========================================================
+    # SLOW CANDLES (v3) – DAILY
+    # ==========================================================
+    @retry(stop=stop_after_attempt(2), wait=wait_fixed(0.5))
+    async def get_daily_candles(
+        self,
+        instrument_key: str,
+        days: int = 400
+    ) -> pd.DataFrame:
+        """
+        SLOW analytics:
+        - GARCH
+        - IVP
+        - Regime detection
+        """
 
-        for x in data:
-            ce = x.get("call_options")
-            pe = x.get("put_options")
-            if not ce or not pe:
-                continue
+        encoded = quote(instrument_key, safe="")
+        url = f"{self.base_v3}/historical-candle/{encoded}/days/1"
 
-            greeks_ce = ce.get("option_greeks") or {}
-            greeks_pe = pe.get("option_greeks") or {}
-            mkt_ce = ce.get("market_data") or {}
-            mkt_pe = pe.get("market_data") or {}
+        to_date = date.today().strftime("%Y-%m-%d")
+        from_date = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-            # Reject strikes with broken greeks
-            if (
-                greeks_ce.get("iv") is None
-                or greeks_pe.get("iv") is None
-                or greeks_ce.get("delta") is None
-                or greeks_pe.get("delta") is None
-            ):
-                continue
+        full_url = f"{url}/{to_date}/{from_date}"
 
-            rows.append(
-                {
-                    "strike": float(x["strike_price"]),
-                    "ce_key": ce["instrument_key"],
-                    "pe_key": pe["instrument_key"],
-                    "ce_iv": float(greeks_ce["iv"]),
-                    "pe_iv": float(greeks_pe["iv"]),
-                    "ce_delta": float(greeks_ce["delta"]),
-                    "pe_delta": float(greeks_pe["delta"]),
-                    "ce_gamma": float(greeks_ce.get("gamma", 0.0)),
-                    "pe_gamma": float(greeks_pe.get("gamma", 0.0)),
-                    "ce_oi": int(mkt_ce.get("oi", 0)),
-                    "pe_oi": int(mkt_pe.get("oi", 0)),
+        resp = await self.client.get(full_url)
+        resp.raise_for_status()
+
+        candles = resp.json().get("data", {}).get("candles", [])
+        return self._to_df(candles)
+
+    # ==========================================================
+    # OPTION CHAIN (v2)
+    # ==========================================================
+    async def get_option_chain(self, expiry_date: str) -> pd.DataFrame:
+        try:
+            url = f"{self.base_v2}/option/chain"
+            resp = await self.client.get(
+                url,
+                params={
+                    "instrument_key": NIFTY_KEY,
+                    "expiry_date": expiry_date
                 }
             )
+            resp.raise_for_status()
 
-        df = pd.DataFrame(rows)
-        return df.dropna().reset_index(drop=True)
+            rows = []
+            for x in resp.json().get("data", []):
+                if not x.get("call_options") or not x.get("put_options"):
+                    continue
 
-    # ======================================================
-    # EXPIRY & LOT
-    # ======================================================
+                rows.append({
+                    "strike": x["strike_price"],
+                    "ce_iv": x["call_options"]["option_greeks"].get("iv", 0),
+                    "pe_iv": x["put_options"]["option_greeks"].get("iv", 0),
+                    "ce_delta": x["call_options"]["option_greeks"].get("delta", 0),
+                    "pe_delta": x["put_options"]["option_greeks"].get("delta", 0),
+                    "ce_oi": x["call_options"]["market_data"].get("oi", 0),
+                    "pe_oi": x["put_options"]["market_data"].get("oi", 0),
+                    "ce_gamma": x["call_options"]["option_greeks"].get("gamma", 0),
+                    "pe_gamma": x["put_options"]["option_greeks"].get("gamma", 0),
+                })
+
+            return pd.DataFrame(rows)
+
+        except Exception as e:
+            logger.error(f"Option chain error: {e}")
+            return pd.DataFrame()
+
+    # ==========================================================
+    # EXPIRIES & LOT SIZE (v2)
+    # ==========================================================
     async def get_expiries_and_lot(self) -> Tuple[Optional[str], Optional[str], int]:
-        resp = await self.client.get(
-            f"{self.base_v2}/option/contract",
-            params={"instrument_key": NIFTY_KEY},
-        )
-        resp.raise_for_status()
+        try:
+            url = f"{self.base_v2}/option/contract"
+            resp = await self.client.get(url, params={"instrument_key": NIFTY_KEY})
+            resp.raise_for_status()
 
-        data = resp.json().get("data", [])
-        if not data:
+            data = resp.json().get("data", [])
+            if not data:
+                return None, None, 0
+
+            lot = int(next((c["lot_size"] for c in data if "lot_size" in c), 50))
+            expiries = sorted(
+                datetime.strptime(c["expiry"], "%Y-%m-%d").date()
+                for c in data if c.get("expiry")
+            )
+
+            future_exp = [e for e in expiries if e >= date.today()]
+            if not future_exp:
+                return None, None, lot
+
+            return (
+                future_exp[0].strftime("%Y-%m-%d"),
+                future_exp[-1].strftime("%Y-%m-%d"),
+                lot
+            )
+
+        except Exception as e:
+            logger.error(f"Expiry fetch error: {e}")
             return None, None, 0
 
-        lot = int(next((c["lot_size"] for c in data if c.get("lot_size")), 50))
+    # ==========================================================
+    # Helpers
+    # ==========================================================
+    def _to_df(self, candles: List[List]) -> pd.DataFrame:
+        if not candles:
+            return pd.DataFrame()
 
-        expiries = sorted(
-            {
-                datetime.strptime(c["expiry"], "%Y-%m-%d").date()
-                for c in data
-                if c.get("expiry")
-            }
+        df = pd.DataFrame(
+            candles,
+            columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]
         )
-
-        valid = [
-            d
-            for d in expiries
-            if (d - date.today()).days >= 2
-        ]
-
-        if not valid:
-            return None, None, lot
-
-        return valid[0].strftime("%Y-%m-%d"), valid[-1].strftime("%Y-%m-%d"), lot
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        return df.astype(float).sort_index()
