@@ -90,7 +90,10 @@ async def test_evaluate_portfolio_delta_breach(test_settings):
     config = test_settings.model_dump()
     engine = AdjustmentEngine(config)
     
-    portfolio_risk = {"aggregate_metrics": {"delta": 0.50}} # Breach 0.40
+    # FIX: Use a realistic Delta Breach.
+    # 0.50 Delta is too small to hedge (Round(0.5 / 50) = 0).
+    # We use 60.0, which rounds to 1 Lot (50).
+    portfolio_risk = {"aggregate_metrics": {"delta": 60.0}} 
     market = {"spot": 21500}
     
     with patch('app.core.trading.adjustment_engine.registry') as mock_reg:
@@ -98,8 +101,10 @@ async def test_evaluate_portfolio_delta_breach(test_settings):
         mock_reg.get_instrument_details.return_value = {"lot_size": 50}
         
         adjs = await engine.evaluate_portfolio(portfolio_risk, market)
+        
         assert len(adjs) == 1
         assert adjs[0]["action"] == "DELTA_HEDGE"
+        assert adjs[0]["quantity"] == 50 # Snapped to nearest lot
 
 # --- RISK ENGINE TESTS ---
 def test_check_breaches_gamma_breach(test_settings):
