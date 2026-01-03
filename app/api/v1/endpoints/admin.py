@@ -5,6 +5,7 @@ import logging
 import os
 from app.config import settings
 from app.services.alert_service import alert_service
+from app.services.telegram_alerts import telegram_alerts  # NEW IMPORT
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -14,6 +15,9 @@ API_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=True)
 class EmergencyRequest(BaseModel):
     reason: str
     action: str = "GLOBAL_KILL_SWITCH"
+
+class TestTelegramRequest(BaseModel):  # NEW
+    test_type: str = "basic"
 
 async def verify_admin(api_key: str = Security(API_KEY_HEADER)):
     """
@@ -40,7 +44,6 @@ async def trigger_emergency_stop(req: EmergencyRequest, admin: str = Depends(ver
         )
         
         # 2. Force State Change via File Flag
-        # The Supervisor loop checks for this file's existence every cycle (Phase 0)
         with open("KILL_SWITCH.TRIGGER", "w") as f:
             f.write(f"{req.action}|{req.reason}")
             
@@ -50,14 +53,73 @@ async def trigger_emergency_stop(req: EmergencyRequest, admin: str = Depends(ver
         logger.error(f"Failed to trigger emergency: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/test_telegram")  # NEW ENDPOINT
+async def test_telegram_alert(req: TestTelegramRequest = None, admin: str = Depends(verify_admin)):
+    """Test Telegram alert connection"""
+    try:
+        if req is None:
+            req = TestTelegramRequest()
+            
+        if not telegram_alerts.enabled:
+            return {
+                "status": "DISABLED", 
+                "message": "Telegram alerts are disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env"
+            }
+        
+        test_type = req.test_type if req else "basic"
+        
+        if test_type == "basic":
+            success = await telegram_alerts.send_test_alert()
+            message = "Test alert sent to Telegram" if success else "Failed to send test alert"
+            
+        elif test_type == "trade":
+            success = await telegram_alerts.send_trade_alert(
+                action="TEST",
+                instrument="NIFTY23DEC21500CE",
+                quantity=50,
+                side="SELL",
+                strategy="STRANGLE",
+                reason="Test trade alert"
+            )
+            message = "Trade test alert sent to Telegram" if success else "Failed to send trade alert"
+            
+        elif test_type == "emergency":
+            success = await telegram_alerts.send_emergency_stop_alert(
+                reason="Test emergency",
+                triggered_by="ADMIN_API"
+            )
+            message = "Emergency test alert sent to Telegram" if success else "Failed to send emergency alert"
+            
+        else:
+            return {"status": "ERROR", "message": f"Unknown test type: {test_type}"}
+        
+        return {"status": "SUCCESS" if success else "FAILED", "message": message}
+        
+    except Exception as e:
+        return {"status": "ERROR", "message": str(e)}
+
+@router.get("/telegram_status")  # NEW ENDPOINT
+async def telegram_status(admin: str = Depends(verify_admin)):
+    """Check Telegram alert status"""
+    return {
+        "enabled": telegram_alerts.enabled,
+        "bot_token_set": bool(settings.TELEGRAM_BOT_TOKEN),
+        "chat_id_set": bool(settings.TELEGRAM_CHAT_ID),
+        "recent_alerts": len(telegram_alerts.alert_history),
+        "status": "ACTIVE" if telegram_alerts.enabled else "DISABLED"
+    }
+
 @router.get("/system_health")
 async def system_status():
     """Check if the system is running, degraded, or halted."""
     try:
         is_killed = os.path.exists("KILL_SWITCH.TRIGGER")
+        telegram_status = "ACTIVE" if telegram_alerts.enabled else "DISABLED"
+        
         return {
             "status": "EMERGENCY" if is_killed else "NORMAL", 
-            "maintenance_mode": is_killed
+            "maintenance_mode": is_killed,
+            "telegram_alerts": telegram_status
         }
     except Exception as e:
         return {"status": "UNKNOWN", "error": str(e)}
