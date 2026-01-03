@@ -1,109 +1,157 @@
 """
 Updated Alert Service - Integrates Telegram with existing logging
+PRODUCTION HARDENED
 """
 import logging
 import httpx
+import asyncio
+import time
 from typing import Dict, Any, Optional
 from app.config import settings
 from app.services.telegram_alerts import telegram_alerts
 
 logger = logging.getLogger(__name__)
 
+# Allowed severities (single source of truth)
+SEVERITIES = {"INFO", "WARNING", "CRITICAL", "EMERGENCY", "TRADE"}
+
 class AlertService:
-    """ 
-    Unified alert system: Logging + Telegram
-    """ 
+    """
+    Unified alert system: Logging + Telegram + Webhooks
+    """
     def __init__(self):
         self.webhook_url = settings.SLACK_WEBHOOK_URL
-        self.client = httpx.AsyncClient(timeout=5.0)
-        
-        # Log Telegram status
+        self._client: Optional[httpx.AsyncClient] = None
+
+        # Simple anti-flood (per severity)
+        self._last_sent = {}
+        self._cooldown_sec = {
+            "WARNING": 10,
+            "CRITICAL": 30,
+            "EMERGENCY": 60,
+            "TRADE": 5,
+        }
+
         if telegram_alerts.enabled:
             logger.info("Telegram alerts INTEGRATED with AlertService")
         else:
             logger.warning("Telegram alerts NOT configured")
 
-    async def send_alert(self, title: str, message: str, severity: str = "INFO", 
-                        data: Optional[Dict] = None, telegram: bool = True):
-        """ 
-        Send alert to all configured channels.
-        """
-        # 1. Log to File/Console (JSON format via logging config)
-        log_payload = {"title": title, "msg": message, "severity": severity, "data": data}
-        
-        if severity in ["CRITICAL", "EMERGENCY"]:
-            logger.critical(str(log_payload))
-        elif severity == "WARNING":
-            logger.warning(str(log_payload))
-        else:
-            logger.info(str(log_payload))
+    # --------------------------------------------------
+    # Internal helpers
+    # --------------------------------------------------
+    def _allowed(self, severity: str) -> bool:
+        now = time.time()
+        cd = self._cooldown_sec.get(severity, 0)
+        last = self._last_sent.get(severity, 0)
+        if now - last < cd:
+            return False
+        self._last_sent[severity] = now
+        return True
 
-        # 2. Send to Telegram (if enabled and requested)
-        if telegram and telegram_alerts.enabled and severity in ["CRITICAL", "EMERGENCY", "WARNING", "TRADE"]:
-            await telegram_alerts.send_alert(title, message, severity, data)
-        
-        # 3. Send to Slack/Discord if configured (existing logic)
-        if self.webhook_url and severity in ["CRITICAL", "EMERGENCY", "WARNING", "TRADE"]:
+    async def _get_client(self) -> httpx.AsyncClient:
+        if not self._client:
+            self._client = httpx.AsyncClient(timeout=5.0)
+        return self._client
+
+    # --------------------------------------------------
+    # Public API
+    # --------------------------------------------------
+    async def send_alert(
+        self,
+        title: str,
+        message: str,
+        severity: str = "INFO",
+        data: Optional[Dict] = None,
+        telegram: bool = True,
+    ):
+        if severity not in SEVERITIES:
+            logger.warning(f"Unknown severity '{severity}', treating as INFO")
+            severity = "INFO"
+
+        payload = {
+            "title": title,
+            "msg": message,
+            "severity": severity,
+            "data": data,
+        }
+
+        # 1. Logging (always)
+        if severity in ("CRITICAL", "EMERGENCY"):
+            logger.critical(payload)
+        elif severity == "WARNING":
+            logger.warning(payload)
+        else:
+            logger.info(payload)
+
+        if not self._allowed(severity):
+            return
+
+        # 2. Telegram
+        if telegram and telegram_alerts.enabled and severity in ("CRITICAL", "EMERGENCY", "WARNING", "TRADE"):
+            try:
+                await telegram_alerts.send_alert(title, message, severity, data)
+            except Exception as e:
+                logger.error(f"Telegram alert failed: {e}")
+
+        # 3. Webhook
+        if self.webhook_url and severity in ("CRITICAL", "EMERGENCY", "WARNING", "TRADE"):
             await self._dispatch_webhook(title, message, severity, data)
 
     async def _dispatch_webhook(self, title: str, message: str, severity: str, data: Dict):
-        try:
-            # Color coding
-            color = "#36a64f" # Green/Info
-            if severity == "WARNING": color = "#ffcc00"
-            if severity in ["CRITICAL", "EMERGENCY"]: color = "#ff0000"
+        color = "#36a64f"
+        if severity == "WARNING":
+            color = "#ffcc00"
+        elif severity in ("CRITICAL", "EMERGENCY"):
+            color = "#ff0000"
 
-            payload = {
-                "text": f"*{severity}*: {title}\n{message}",
-                "attachments": [
-                    {
-                        "color": color,
-                        "fields": [{"title": k, "value": str(v), "short": True} for k, v in (data or {}).items()]
-                    }
-                ]
-            }
-            await self.client.post(self.webhook_url, json=payload)
+        payload = {
+            "text": f"*{severity}*: {title}\n{message}",
+            "attachments": [
+                {
+                    "color": color,
+                    "fields": [
+                        {"title": k, "value": str(v), "short": True}
+                        for k, v in (data or {}).items()
+                    ],
+                }
+            ],
+        }
+
+        try:
+            client = await self._get_client()
+            await client.post(self.webhook_url, json=payload)
         except Exception as e:
-            logger.error(f"Failed to send webhook: {e}")
+            logger.warning(f"Webhook delivery failed: {e}")
 
     async def send_emergency_stop(self, reason: str, triggered_by: str = "SYSTEM"):
-        """Emergency stop with Telegram alert"""
-        # Critical log
-        logger.critical(f"EMERGENCY STOP: {reason} (triggered by: {triggered_by})")
-        
-        # Telegram emergency alert
+        logger.critical(f"EMERGENCY STOP: {reason} (triggered by {triggered_by})")
         if telegram_alerts.enabled:
             await telegram_alerts.send_emergency_stop_alert(reason, triggered_by)
-    
-    async def send_trade_execution(self, action: str, instrument: str, quantity: int, 
-                                  side: str, strategy: str, reason: str = ""):
-        """Trade execution alert"""
-        logger.info(f"TRADE {action}: {side} {quantity} {instrument} ({strategy}) - {reason}")
-        
-        # Telegram trade alert
+
+    async def send_trade_execution(
+        self,
+        action: str,
+        instrument: str,
+        quantity: int,
+        side: str,
+        strategy: str,
+        reason: str = "",
+    ):
+        logger.info(
+            f"TRADE {action}: {side} {quantity} {instrument} ({strategy}) - {reason}"
+        )
         if telegram_alerts.enabled:
-            await telegram_alerts.send_trade_alert(action, instrument, quantity, side, strategy, reason)
-    
-    async def test_telegram_connection(self):
-        """Test Telegram connectivity"""
-        logger.info("Testing Telegram connection...")
-        if not telegram_alerts.enabled:
-            logger.warning("Telegram alerts are disabled")
-            return False
-        
-        success = await telegram_alerts.send_test_alert()
-        
-        if success:
-            logger.info("✅ Telegram alerts: CONNECTED")
-            return True
-        else:
-            logger.warning("❌ Telegram alerts: FAILED")
-            return False
+            await telegram_alerts.send_trade_alert(
+                action, instrument, quantity, side, strategy, reason
+            )
 
     async def close(self):
-        await self.client.aclose()
+        if self._client:
+            await self._client.aclose()
         if telegram_alerts.enabled:
             await telegram_alerts.close()
 
-# Global Instance
+
+# Global instance
 alert_service = AlertService()
