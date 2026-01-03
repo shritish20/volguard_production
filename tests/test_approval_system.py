@@ -257,4 +257,41 @@ def test_approval_request_model():
     assert isinstance(request.timestamp, datetime)
     assert isinstance(request.expires_at, datetime)
     assert request.adjustment == {"action": "TEST"}
-    assert request.market_snapshot == {"spot": 21500
+    assert request.market_snapshot == {"spot": 21500}
+    assert request.decision_time is None
+
+@pytest.mark.asyncio
+async def test_approval_workflow_integration(approval_system):
+    """Test complete approval workflow"""
+    # 1. Request approval
+    adjustment = {
+        "action": "ENTRY",
+        "instrument_key": "NSE_INDEX:Nifty 50-21500-CE",
+        "quantity": 50,
+        "side": "SELL",
+        "strategy": "STRANGLE"
+    }
+    
+    market = {"spot": 21500.50, "vix": 14.2}
+    
+    req_id = await approval_system.request_approval(adjustment, market)
+    assert await approval_system.check_approval_status(req_id) == "PENDING"
+    
+    # 2. Wait (simulate) and check status
+    # Status should still be PENDING
+    assert await approval_system.check_approval_status(req_id) == "PENDING"
+    
+    # 3. Approve
+    assert await approval_system.approve_request(req_id) == True
+    assert await approval_system.check_approval_status(req_id) == "APPROVED"
+    
+    # 4. Try to approve again (should fail)
+    assert await approval_system.approve_request(req_id) == False
+    assert await approval_system.reject_request(req_id) == False  # Already decided
+    
+    # 5. Check final state
+    async with AsyncSessionLocal() as session:
+        request = await session.get(ApprovalRequest, req_id)
+        assert request.status == "APPROVED"
+        assert request.decision_time is not None
+        assert request.adjustment == adjustment
