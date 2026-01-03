@@ -13,6 +13,7 @@ from app.core.analytics.regime import RegimeEngine
 from app.core.trading.adjustment_engine import AdjustmentEngine
 from app.core.risk.engine import RiskEngine
 from app.core.risk.stress_tester import StressTester
+from app.core.data.quality_gate import DataQualityGate
 from app.schemas.analytics import VolMetrics, StructMetrics, EdgeMetrics, ExtMetrics
 
 # --- SAFETY CONTROLLER TESTS ---
@@ -68,16 +69,10 @@ def test_structure_engine_calculation(mock_option_chain):
     
     # FIX: Ensure spot is aligned with strikes in mock_option_chain
     # strikes are 21000...21900. Spot at 21500 is perfect.
-    # Also ensure we pass the correct spot to the function.
-    
     result = engine.analyze_structure(mock_option_chain, 21500.0, 50)
     
-    # Just verify the object is created correctly. 
-    # Exact GEX value depends on implementation details of gamma calculation
-    # but it should not be None
     assert isinstance(result, StructMetrics)
-    # Allow 0.0 only if calculation is valid, but verify object exists
-    assert result.pcr > 0 # PCR should be valid given the mock data has OI
+    assert result.pcr > 0 
 
 def test_regime_engine_calculation():
     engine = RegimeEngine()
@@ -119,7 +114,6 @@ def test_stress_test_calculation(mock_position):
     result = tester.simulate_scenarios({"p1": mock_position}, 21500, 14.0)
     assert "WORST_CASE" in result
     assert len(result["matrix"]) == 6
-from app.core.data.quality_gate import DataQualityGate
 
 # --- DATA QUALITY TESTS (The Final Check) ---
 def test_validate_snapshot_valid():
@@ -148,4 +142,5 @@ def test_validate_structure_empty():
     # API returned empty chain
     is_valid, reason = gate.validate_structure(pd.DataFrame())
     assert is_valid == False
-    assert "Empty Chain" in reason
+    # FIX: Corrected expected string to match DataQualityGate implementation
+    assert "Empty Option Chain" in reason
