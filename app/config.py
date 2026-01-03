@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "production"
     DEBUG: bool = False
 
+    # Security (NEW: Dedicated Admin Key)
+    ADMIN_SECRET: str = "change_this_to_something_secure"
+
     # Upstox Credentials
     UPSTOX_ACCESS_TOKEN: str
     UPSTOX_API_KEY: Optional[str] = None
@@ -36,7 +39,7 @@ class Settings(BaseSettings):
     MAX_POSITIONS: int = 10
     MAX_POSITION_SIZE: int = 100
     
-    # Margins (Corrected Typo from env.example)
+    # Margins
     MARGIN_SELL: float = 120000.0
     MARGIN_BUY: float = 30000.0
     
