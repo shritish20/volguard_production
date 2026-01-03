@@ -1,4 +1,5 @@
 # app/lifecycle/supervisor.py
+
 import asyncio
 import time
 import logging
@@ -31,8 +32,9 @@ logger = logging.getLogger(__name__)
 
 class ProductionTradingSupervisor:
     """
-    Authoritative Production Supervisor
+    AUTHORITATIVE PRODUCTION SUPERVISOR
     Regime → Strategy → Execution
+    Risk-first, capital-aware, execution-safe
     """
 
     def __init__(
@@ -46,6 +48,7 @@ class ProductionTradingSupervisor:
         loop_interval_seconds: float = 3.0,
         total_capital: float = 1_000_000,
     ):
+        # Core services
         self.market = market_client
         self.risk = risk_engine
         self.adj = adjustment_engine
@@ -53,13 +56,13 @@ class ProductionTradingSupervisor:
         self.engine = trading_engine
         self.ws = websocket_service
 
-        # Safety & Governance
+        # Safety & governance
         self.quality = DataQualityGate()
         self.safety = SafetyController()
         self.cap_governor = CapitalGovernor(total_capital=total_capital)
         self.approvals = ManualApprovalSystem()
 
-        # Analytics Brain
+        # Analytics brain
         self.exit_engine = ExitEngine()
         self.regime_engine = RegimeEngine()
         self.structure_engine = StructureEngine()
@@ -73,12 +76,16 @@ class ProductionTradingSupervisor:
         self.cycle_counter = 0
 
         # Entry controls
-        self.last_entry_time = 0
-        self.min_entry_interval = 300  # 5 minutes
+        self.last_entry_time = 0.0
+        self.min_entry_interval = 300  # seconds
 
-        # 🔒 Regime stability buffer (MANDATORY)
+        # Regime stability protection
         self.regime_history = deque(maxlen=5)
+        self.regime_last_change = time.time()
 
+    # ==========================================================
+    # MAIN LOOP
+    # ==========================================================
     async def start(self):
         logger.info(f"Supervisor starting in {self.safety.execution_mode.value} mode")
 
@@ -96,9 +103,9 @@ class ProductionTradingSupervisor:
         self.running = True
 
         while self.running:
-            # ==========================================================
+            # ======================================================
             # PHASE 0: EMERGENCY KILL SWITCH
-            # ==========================================================
+            # ======================================================
             if os.path.exists("KILL_SWITCH.TRIGGER"):
                 reason = "MANUAL_TRIGGER"
                 try:
@@ -122,13 +129,17 @@ class ProductionTradingSupervisor:
 
             cycle_id = str(uuid.uuid4())[:8]
             start_time = time.time()
-            cycle_log = {"cycle_id": cycle_id, "mode": self.safety.execution_mode.value}
             action_taken = False
 
+            cycle_log = {
+                "cycle_id": cycle_id,
+                "execution_mode": self.safety.execution_mode.value,
+            }
+
             try:
-                # ==========================================================
+                # ======================================================
                 # PHASE 1: DATA & QUALITY
-                # ==========================================================
+                # ======================================================
                 snapshot = await self._read_data()
                 valid, reason = self.quality.validate_snapshot(snapshot)
 
@@ -141,27 +152,36 @@ class ProductionTradingSupervisor:
 
                 await self.safety.record_success()
 
-                # ==========================================================
+                # ======================================================
                 # PHASE 2: POSITION RECONCILIATION
-                # ==========================================================
+                # ======================================================
                 self.positions = await self._update_positions(snapshot)
-                est_margin = len(self.positions) * 150_000
+                est_margin = len(self.positions) * 150_000  # placeholder, conservative
                 self.cap_governor.update_state(est_margin, len(self.positions))
 
-                # ==========================================================
-                # PHASE 3: RISK ASSESSMENT
-                # ==========================================================
+                # ======================================================
+                # PHASE 3: RISK ASSESSMENT (HARD GATE)
+                # ======================================================
                 risk_report = await self.risk.run_stress_tests(
                     {}, snapshot, self.positions
                 )
+                worst_case = risk_report.get("WORST_CASE", {}).get("impact", 0.0)
+
                 cycle_log["risk"] = risk_report.get("WORST_CASE", {})
 
-                # ==========================================================
+                # Block new entries if stress risk is unacceptable
+                stress_block = worst_case < -0.03 * snapshot["spot"]
+                if stress_block:
+                    logger.warning(
+                        f"[{cycle_id}] Stress block active (worst={worst_case:.2f})"
+                    )
+
+                # ======================================================
                 # PHASE 4: DECISION ENGINE
-                # ==========================================================
+                # ======================================================
                 adjustments = []
 
-                # ---- A. Exits always first
+                # ---- A. Exits FIRST (always allowed)
                 exits = await self.exit_engine.evaluate_exits(
                     list(self.positions.values()), snapshot
                 )
@@ -179,15 +199,16 @@ class ProductionTradingSupervisor:
                     can_add, cap_msg = self.cap_governor.can_trade_new(
                         150_000, {"strategy": "ENTRY"}
                     )
-                    if not can_add:
-                        logger.warning(f"Capital block: {cap_msg}")
 
                     if time.time() - self.last_entry_time < self.min_entry_interval:
                         can_add = False
 
+                    if stress_block:
+                        can_add = False
+
                     if not self.positions and not hedges and can_add:
-                        # Heavy analytics only when needed
                         expiry, mo_expiry, lot = await self.market.get_expiries_and_lot()
+
                         if expiry:
                             nh, vh, wc = await asyncio.gather(
                                 self.market.get_history(NIFTY_KEY),
@@ -213,38 +234,49 @@ class ProductionTradingSupervisor:
                                 )
                                 ext = ExtMetrics(0, 0, 0, [], False)
 
-                                regime: RegimeResult = (
-                                    self.regime_engine.calculate_regime(
-                                        vol, st, ed, ext
-                                    )
+                                regime: RegimeResult = self.regime_engine.calculate_regime(
+                                    vol, st, ed, ext
                                 )
 
-                                # 🔒 Regime stability enforcement
+                                # ---- Regime stability tracking
+                                if (
+                                    len(self.regime_history) > 0
+                                    and regime.name != self.regime_history[-1]
+                                ):
+                                    self.regime_last_change = time.time()
+
                                 self.regime_history.append(regime.name)
+
                                 stable = (
                                     len(self.regime_history)
                                     == self.regime_history.maxlen
                                     and len(set(self.regime_history)) == 1
                                 )
 
+                                override = (
+                                    time.time() - self.regime_last_change > 1800
+                                )  # 30 min
+
                                 cycle_log["regime"] = regime.name
                                 cycle_log["score"] = regime.score
+                                cycle_log["regime_stable"] = stable
+                                cycle_log["regime_override"] = override
 
-                                if not stable:
-                                    logger.info(
-                                        f"[{cycle_id}] Regime unstable → skipping entry"
-                                    )
-                                else:
+                                if stable or override:
                                     entries = await self.engine.generate_entry_orders(
                                         regime, vol, snapshot
                                     )
                                     if entries:
                                         self.last_entry_time = time.time()
                                         adjustments.extend(entries)
+                                else:
+                                    logger.info(
+                                        f"[{cycle_id}] Regime unstable → entry skipped"
+                                    )
 
-                # ==========================================================
+                # ======================================================
                 # PHASE 5: EXECUTION
-                # ==========================================================
+                # ======================================================
                 for adj in adjustments:
                     adj["cycle_id"] = cycle_id
 
@@ -265,13 +297,28 @@ class ProductionTradingSupervisor:
 
                     if mode == ExecutionMode.SHADOW:
                         logger.info(f"[{cycle_id}] SHADOW {adj}")
+
                     elif mode == ExecutionMode.SEMI_AUTO:
                         await self.approvals.request_approval(adj, snapshot)
+
                     elif mode == ExecutionMode.FULL_AUTO:
-                        await self.exec.execute_adjustment(adj)
-                        action_taken = True
+                        result = await self.exec.execute_adjustment(adj)
+                        if result.get("status") == "SUCCESS":
+                            action_taken = True
+                        else:
+                            logger.error(
+                                f"[{cycle_id}] Execution failed: {result}"
+                            )
+                            await self.safety.record_failure(
+                                "EXECUTION", result
+                            )
 
                 cycle_log["action_taken"] = action_taken
+                cycle_log["positions"] = len(self.positions)
+                cycle_log["entries_attempted"] = any(
+                    a.get("action") == "ENTRY" for a in adjustments
+                )
+
                 self.cycle_counter += 1
 
             except Exception as e:
@@ -283,7 +330,7 @@ class ProductionTradingSupervisor:
                 await self._sleep_rest(start_time)
 
     # ==========================================================
-    # Helper methods
+    # HELPERS
     # ==========================================================
     async def _read_data(self):
         spot = await self.market.get_spot_price()
@@ -294,6 +341,7 @@ class ProductionTradingSupervisor:
     async def _update_positions(self, snapshot):
         raw = await self.exec.get_positions()
         pos_map = {}
+
         for p in raw:
             t = self._calculate_time_to_expiry(p.get("expiry"))
             if p.get("greeks", {}).get("delta") is None:
@@ -306,6 +354,7 @@ class ProductionTradingSupervisor:
                     p.get("option_type", "CE"),
                 )
             pos_map[p["position_id"]] = p
+
         return pos_map
 
     def _calculate_time_to_expiry(self, expiry: Union[str, datetime, None]) -> float:
@@ -332,12 +381,16 @@ class ProductionTradingSupervisor:
     def _calc_net_delta(self) -> float:
         total = 0.0
         for p in self.positions.values():
-            qty = p["quantity"]
-            side = 1 if p["side"] == "BUY" else -1
+            qty = p.get("quantity", 0)
+            lot = p.get("lot_size", 50)
+            side = 1 if p.get("side") == "BUY" else -1
             delta = p.get("greeks", {}).get("delta", 0)
+
             if "FUT" in p.get("symbol", ""):
                 delta = 1.0
-            total += delta * qty * side
+
+            total += delta * qty * lot * side
+
         return total
 
     async def _sleep_rest(self, start_time):
