@@ -116,7 +116,6 @@ class ProductionTradingSupervisor:
                 
                 if not self.positions and not hedges and can_add:
                     # In a real regime engine, this comes from regime.py. 
-                    # For now we verify flow.
                     pass 
                 
                 cycle_log['regime'] = regime_name
@@ -192,10 +191,8 @@ class ProductionTradingSupervisor:
             t = self._calculate_time_to_expiry(p.get("expiry"))
             
             # GREEKS CONSISTENCY FIX
-            # If broker provides greeks, use them. Else calculate.
             if p.get('greeks') and p['greeks'].get('delta') and p['greeks'].get('delta') != 0:
-                # Trust the broker/registry enriched greeks
-                pass 
+                pass # Broker greeks exist
             else:
                 # Fallback to internal engine
                 p['greeks'] = self.risk.calculate_leg_greeks(
