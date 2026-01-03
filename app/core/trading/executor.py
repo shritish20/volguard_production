@@ -1,104 +1,157 @@
+# app/core/trading/trade_executor.py
+
 import upstox_client
 from upstox_client.rest import ApiException
-from app.database import AsyncSessionLocal, TradeRecord
-from app.services.instrument_registry import registry
+import asyncio
 import uuid
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
+from app.database import AsyncSessionLocal, TradeRecord
+from app.services.instrument_registry import registry
 
 logger = logging.getLogger(__name__)
 
+
 class TradeExecutor:
+    """
+    SINGLE SOURCE OF TRUTH FOR ORDER EXECUTION.
+    Never lie about execution state.
+    """
+
     def __init__(self, access_token: str):
-        config = upstox_client.Configuration()
-        config.access_token = access_token
-        self.api_client = upstox_client.ApiClient(config)
+        cfg = upstox_client.Configuration()
+        cfg.access_token = access_token
+        self.api_client = upstox_client.ApiClient(cfg)
+
         self.order_api = upstox_client.OrderApi(self.api_client)
         self.portfolio_api = upstox_client.PortfolioApi(self.api_client)
-        self.quote_api = upstox_client.MarketQuoteApi(self.api_client) # Needed for Limit Protection
+        self.quote_api = upstox_client.MarketQuoteApi(self.api_client)
 
+        # Idempotency cache (in-memory, supervisor-scoped)
+        self._order_cache = set()
+
+    # --------------------------------------------------
+    # POSITIONS
+    # --------------------------------------------------
     async def get_positions(self) -> List[Dict]:
-        """Fetch positions and ENRICH with Registry Data"""
         try:
-            response = self.portfolio_api.get_positions(api_version="2.0")
-            data = response.data
-            if not data: return []
-            
+            response = await asyncio.to_thread(
+                self.portfolio_api.get_positions, api_version="2.0"
+            )
+            data = response.data or []
+
             positions = []
             for p in data:
-                if p.quantity != 0:
-                    details = registry.get_instrument_details(p.instrument_token)
-                    positions.append({
+                if int(p.quantity) == 0:
+                    continue
+
+                details = registry.get_instrument_details(p.instrument_token)
+                side = "BUY" if p.net_quantity > 0 else "SELL"
+
+                positions.append(
+                    {
                         "position_id": p.instrument_token,
                         "instrument_key": p.instrument_token,
                         "symbol": p.trading_symbol,
-                        "quantity": int(p.quantity),
-                        "side": "BUY" if int(p.quantity) > 0 else "SELL",
-                        "average_price": float(p.buy_price) if int(p.quantity) > 0 else float(p.sell_price),
+                        "quantity": abs(int(p.net_quantity)),
+                        "side": side,
+                        "average_price": float(p.buy_price or p.sell_price),
                         "current_price": float(p.last_price),
                         "pnl": float(p.pnl),
-                        "strike": details.get("strike", 0.0),
+                        "strike": details.get("strike"),
                         "expiry": details.get("expiry"),
-                        "lot_size": details.get("lot_size", 0),
-                        "option_type": "CE" if "CE" in p.trading_symbol else "PE"
-                    })
+                        "lot_size": details.get("lot_size"),
+                        "option_type": "CE" if "CE" in p.trading_symbol else "PE",
+                    }
+                )
+
             return positions
+
         except Exception as e:
-            logger.error(f"Error fetching positions: {e}")
+            logger.error(f"Position fetch failed: {e}")
             return []
 
-    async def execute_adjustment(self, adjustment: Dict) -> Dict:
-        key = adjustment.get("instrument_key")
-        
-        # Resolve Dynamic Token
-        if key == "NIFTY_FUT_CURRENT":
-            key = registry.get_current_future("NIFTY")
-            if not key: return {"status": "FAILED", "reason": "Future Not Found"}
+    # --------------------------------------------------
+    # EXECUTION
+    # --------------------------------------------------
+    async def execute_adjustment(self, adj: Dict) -> Dict:
+        instrument_key = adj.get("instrument_key")
+        qty = abs(int(adj.get("quantity", 0)))
+        side = adj.get("side")
+        strategy = adj.get("strategy", "AUTO")
 
-        qty = abs(int(adjustment.get("quantity", 0)))
-        side = adjustment.get("side", "BUY")
-        
-        # 1. Fetch LTP for Limit Protection
-        try:
-            quote = self.quote_api.ltp(instrument_key=key, api_version="2.0")
-            ltp = float(quote.data[key.replace(':', '')].last_price)
-        except:
-            ltp = 0.0
+        if qty <= 0 or side not in ("BUY", "SELL"):
+            return {"status": "FAILED", "reason": "Invalid order params"}
 
-        # 2. Calculate Limit Price (Marketable Limit)
-        # Buy: LTP + 5% | Sell: LTP - 5%
-        # This guarantees execution like a Market order but prevents filling at infinity.
-        if side == "BUY":
-            price = ltp * 1.05 if ltp > 0 else 0
-        else:
-            price = ltp * 0.95 if ltp > 0 else 0
-            
-        # If LTP failed, fall back to MARKET (Risky, but necessary if data is down)
-        order_type = "LIMIT" if price > 0 else "MARKET"
+        # Resolve dynamic future
+        if instrument_key == "NIFTY_FUT_CURRENT":
+            instrument_key = registry.get_current_future("NIFTY")
+            if not instrument_key:
+                return {"status": "FAILED", "reason": "Future not found"}
+
+        # Idempotency key
+        idem_key = f"{instrument_key}:{qty}:{side}:{strategy}"
+        if idem_key in self._order_cache:
+            logger.warning(f"Duplicate order blocked: {idem_key}")
+            return {"status": "DUPLICATE"}
+
+        self._order_cache.add(idem_key)
+
+        # Fetch LTP
+        ltp = await self._safe_ltp(instrument_key)
+
+        # Escalating protection
+        price = 0.0
+        order_type = "MARKET"
+
+        if ltp > 0:
+            buffer = 0.02  # 2%
+            price = round(ltp * (1 + buffer if side == "BUY" else 1 - buffer), 2)
+            order_type = "LIMIT"
 
         try:
             req = upstox_client.PlaceOrderRequest(
-                quantity=qty,
-                product="D", 
-                validity="DAY", 
-                price=round(price, 2),
-                tag="VolGuard_Auto",
-                instrument_token=key,
-                order_type=order_type,
+                instrument_token=instrument_key,
                 transaction_type=side,
+                quantity=qty,
+                order_type=order_type,
+                price=price,
+                product="D",
+                validity="DAY",
                 disclosed_quantity=0,
                 trigger_price=0.0,
-                is_amo=False
+                is_amo=False,
+                tag="VolGuard",
             )
-            
-            resp = self.order_api.place_order(req, api_version="2.0")
-            
-            await self._persist_trade(resp.data.order_id, key, qty, side, adjustment.get("strategy"))
-            return {"status": "SUCCESS", "order_id": resp.data.order_id}
-            
+
+            resp = await asyncio.to_thread(
+                self.order_api.place_order, req, api_version="2.0"
+            )
+
+            await self._persist_trade(resp.data.order_id, instrument_key, qty, side, strategy)
+
+            return {
+                "status": "PLACED",
+                "order_id": resp.data.order_id,
+                "order_type": order_type,
+                "price": price,
+            }
+
         except ApiException as e:
-            logger.error(f"API Error: {e}")
+            logger.error(f"Order rejected: {e}")
             return {"status": "FAILED", "error": str(e)}
+
+    # --------------------------------------------------
+    # HELPERS
+    # --------------------------------------------------
+    async def _safe_ltp(self, key: str) -> float:
+        try:
+            q = await asyncio.to_thread(
+                self.quote_api.ltp, instrument_key=key, api_version="2.0"
+            )
+            return float(q.data[key.replace(":", "")].last_price)
+        except Exception:
+            return 0.0
 
     async def _persist_trade(self, order_id, token, qty, side, strategy):
         try:
@@ -110,24 +163,27 @@ class TradeExecutor:
                     instrument_key=token,
                     quantity=qty,
                     side=side,
-                    strategy=strategy or "AUTO",
+                    strategy=strategy,
                     strike=details.get("strike"),
                     expiry=details.get("expiry"),
-                    lot_size=details.get("lot_size")
+                    lot_size=details.get("lot_size"),
                 )
                 session.add(trade)
                 await session.commit()
         except Exception as e:
-            logger.error(f"Persistence Failed: {e}")
+            logger.error(f"Trade persistence failed: {e}")
 
+    # --------------------------------------------------
+    # PANIC CLOSE
+    # --------------------------------------------------
     async def close_all_positions(self, reason: str):
-        # Implementation of panic close logic
         positions = await self.get_positions()
         for p in positions:
-            side = "SELL" if p['side'] == "BUY" else "BUY" # Inverse side
-            await self.execute_adjustment({
-                "instrument_key": p['instrument_key'],
-                "quantity": p['quantity'],
-                "side": side,
-                "strategy": reason
-            })
+            await self.execute_adjustment(
+                {
+                    "instrument_key": p["instrument_key"],
+                    "quantity": p["quantity"],
+                    "side": "SELL" if p["side"] == "BUY" else "BUY",
+                    "strategy": reason,
+                }
+            )
