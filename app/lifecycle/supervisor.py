@@ -9,9 +9,11 @@ from app.services.instrument_registry import registry
 from app.core.data.quality_gate import DataQualityGate
 from app.database import add_decision_log
 from app.services.alert_service import alert_service
+from app.services.telegram_alerts import telegram_alerts  # NEW IMPORT
 from app.lifecycle.safety_controller import SafetyController, ExecutionMode
 from app.core.risk.capital_governor import CapitalGovernor
 from app.services.approval_system import ManualApprovalSystem
+from app.config import settings  # NEW IMPORT
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +38,24 @@ class ProductionTradingSupervisor:
         self.interval = loop_interval_seconds
         self.running = False
         self.positions = {}
+        self.cycle_counter = 0  # NEW: For periodic alerts
         
     async def start(self):
         logger.info(f"Supervisor Starting in {self.safety.execution_mode.value} mode...")
+        
+        # Send startup alert to Telegram
+        if telegram_alerts.enabled:
+            await telegram_alerts.send_alert(
+                title="VolGuard Supervisor STARTING",
+                message=f"Starting in {self.safety.execution_mode.value} mode",
+                severity="INFO",
+                data={
+                    "mode": self.safety.execution_mode.value,
+                    "environment": settings.ENVIRONMENT,
+                    "capital": self.cap_governor.total_capital
+                }
+            )
+        
         registry.load_master() 
         if self.ws: await self.ws.connect()
         self.running = True
@@ -48,8 +65,15 @@ class ProductionTradingSupervisor:
             if os.path.exists("KILL_SWITCH.TRIGGER"):
                 logger.critical("KILL SWITCH DETECTED. SHUTTING DOWN.")
                 try:
-                    with open("KILL_SWITCH.TRIGGER", "r") as f: reason = f.read().strip()
-                except: reason = "MANUAL_TRIGGER"
+                    with open("KILL_SWITCH.TRIGGER", "r") as f: 
+                        reason = f.read().strip()
+                except: 
+                    reason = "MANUAL_TRIGGER"
+                
+                # Telegram emergency alert
+                if telegram_alerts.enabled:
+                    await telegram_alerts.send_emergency_stop_alert(reason, "KILL_SWITCH_FILE")
+                
                 await self.exec.close_all_positions(reason)
                 self.running = False
                 await alert_service.send_alert("SYSTEM SHUTDOWN", f"Kill switch: {reason}", "EMERGENCY")
@@ -67,6 +91,15 @@ class ProductionTradingSupervisor:
                 
                 if not is_valid:
                     logger.warning(f"[{cycle_id}] Data Invalid: {reason}. Skipping.")
+                    
+                    # Telegram data quality alert
+                    if telegram_alerts.enabled:
+                        await telegram_alerts.send_data_quality_alert(
+                            quality_score=0.0,
+                            issues=[reason],
+                            system_state=self.safety.system_state.name
+                        )
+                    
                     await self.safety.record_failure("DATA_QUALITY", {"reason": reason})
                     cycle_log['details']['error'] = reason
                     await self._sleep_rest(start_time)
@@ -78,9 +111,18 @@ class ProductionTradingSupervisor:
                 self.positions = await self._update_positions(snapshot)
                 
                 # Update Capital Governor with current utilization
-                # Assuming simplified margin tracking (e.g. 1.5L per lot)
                 est_margin_used = len(self.positions) * 150000 
                 self.cap_governor.update_state(est_margin_used, len(self.positions))
+
+                # Check capital limits
+                if est_margin_used > self.cap_governor.total_capital * 0.9:  # 90% utilization
+                    if telegram_alerts.enabled:
+                        await telegram_alerts.send_capital_breach_alert(
+                            current_margin=est_margin_used,
+                            total_capital=self.cap_governor.total_capital,
+                            estimated_margin=150000,
+                            breach_type="HIGH_UTILIZATION"
+                        )
 
                 # --- PHASE 3: RISK ASSESSMENT ---
                 risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions)
@@ -92,7 +134,7 @@ class ProductionTradingSupervisor:
                 # --- PHASE 4: DECISION ENGINE ---
                 adjs = []
                 
-                # A. Defensive Hedges (Always active in FULL/SEMI/SHADOW to log intent)
+                # A. Defensive Hedges
                 net_delta = self._calc_net_delta()
                 hedges = await self.adj.evaluate_portfolio(
                     {"aggregate_metrics": {"delta": net_delta}}, snapshot
@@ -101,7 +143,6 @@ class ProductionTradingSupervisor:
                 
                 # B. Offensive Entries
                 regime_name = "NEUTRAL"
-                # Only look for entries if we have room and aren't hedging
                 can_add, _ = self.cap_governor.can_trade_new(150000, {}) # Pre-check
                 
                 if not self.positions and not hedges and can_add:
@@ -113,8 +154,6 @@ class ProductionTradingSupervisor:
                 cycle_log['regime'] = regime_name
 
                 # --- PHASE 5: EXECUTION GATEKEEPER ---
-                # This logic fixes the "Trading in Shadow Mode" risk
-                
                 for adj in adjs:
                     adj['cycle_id'] = cycle_id
                     
@@ -125,12 +164,20 @@ class ProductionTradingSupervisor:
                         continue
 
                     # 2. Capital Check
-                    # We skip check if it's a CLOSE/HEDGE (reducing risk), only check for new ENTRIES
-                    is_entry = adj.get('side') == 'SELL' and adj.get('quantity') > 0 # Simplified
+                    is_entry = adj.get('side') == 'SELL' and adj.get('quantity') > 0
                     if is_entry:
                         allowed, cap_msg = self.cap_governor.can_trade_new(150000, adj)
                         if not allowed:
                             logger.warning(f"Blocked by Capital Governor: {cap_msg}")
+                            
+                            # Telegram capital breach alert
+                            if telegram_alerts.enabled:
+                                await telegram_alerts.send_capital_breach_alert(
+                                    current_margin=self.cap_governor.current_margin,
+                                    total_capital=self.cap_governor.total_capital,
+                                    estimated_margin=150000,
+                                    breach_type="NEW_POSITION_BLOCKED"
+                                )
                             continue
 
                     # 3. Execution Mode Logic
@@ -147,13 +194,51 @@ class ProductionTradingSupervisor:
                         
                     elif mode == ExecutionMode.FULL_AUTO:
                         logger.info(f"[{cycle_id}] FULL_AUTO: Executing {adj}")
+                        
+                        # Send trade alert to Telegram
+                        if telegram_alerts.enabled:
+                            await telegram_alerts.send_trade_alert(
+                                action="EXECUTED",
+                                instrument=adj.get('instrument_key', 'Unknown'),
+                                quantity=adj.get('quantity', 0),
+                                side=adj.get('side', 'UNKNOWN'),
+                                strategy=adj.get('strategy', 'UNKNOWN'),
+                                reason=adj.get('reason', '')
+                            )
+                        
                         await self.exec.execute_adjustment(adj)
                         action_taken = True
 
                 cycle_log['action_taken'] = action_taken
+                self.cycle_counter += 1
+
+                # --- PERIODIC STATUS UPDATE (every 100 cycles) ---
+                if self.cycle_counter % 100 == 0 and telegram_alerts.enabled:
+                    elapsed = time.time() - start_time
+                    await telegram_alerts.send_supervisor_status(
+                        system_state=self.safety.system_state.name,
+                        execution_mode=self.safety.execution_mode.value,
+                        positions_count=len(self.positions),
+                        cycle_time=elapsed if elapsed > 0 else 0.0,
+                        data_quality=1.0  # You can calculate this from DataQualityGate
+                    )
 
             except Exception as e:
                 logger.error(f"[{cycle_id}] Cycle Crash: {e}", exc_info=True)
+                
+                # Telegram crash alert
+                if telegram_alerts.enabled:
+                    await telegram_alerts.send_alert(
+                        title="Supervisor Cycle CRASH",
+                        message=f"Cycle {cycle_id} crashed with error",
+                        severity="CRITICAL",
+                        data={
+                            "cycle_id": cycle_id,
+                            "error": str(e),
+                            "system_state": self.safety.system_state.name
+                        }
+                    )
+                
                 await alert_service.send_alert("Cycle Crash", str(e), "CRITICAL")
                 cycle_log['details']['exception'] = str(e)
                 
@@ -172,10 +257,8 @@ class ProductionTradingSupervisor:
         raw_pos = await self.exec.get_positions()
         pos_map = {}
         for p in raw_pos:
-            # ROBUST Expiry Parsing (Fixes the 8% Gap)
             t = self._calculate_time_to_expiry(p.get("expiry"))
             
-            # Recalculate Greeks
             greeks = self.risk.calculate_leg_greeks(
                 p['current_price'], snapshot['spot'], p.get("strike", 0), t, 0.06, p.get("option_type", "CE")
             )
@@ -184,12 +267,10 @@ class ProductionTradingSupervisor:
         return pos_map
 
     def _calculate_time_to_expiry(self, expiry: Union[str, datetime, None]) -> float:
-        """Safe Time Calculation that never crashes"""
         try:
-            if not expiry: return 0.05 # Default 
+            if not expiry: return 0.05
             
             if isinstance(expiry, str):
-                # Try common formats
                 for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y"]:
                     try:
                         expiry = datetime.strptime(expiry, fmt)
@@ -199,7 +280,7 @@ class ProductionTradingSupervisor:
             if isinstance(expiry, datetime):
                 delta = (expiry - datetime.now()).total_seconds()
                 years = delta / (365 * 24 * 3600)
-                return max(years, 0.001) # Minimum 1/1000th of year
+                return max(years, 0.001)
                 
             return 0.05
         except Exception:
