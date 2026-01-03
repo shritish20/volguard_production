@@ -119,3 +119,33 @@ def test_stress_test_calculation(mock_position):
     result = tester.simulate_scenarios({"p1": mock_position}, 21500, 14.0)
     assert "WORST_CASE" in result
     assert len(result["matrix"]) == 6
+from app.core.data.quality_gate import DataQualityGate
+
+# --- DATA QUALITY TESTS (The Final Check) ---
+def test_validate_snapshot_valid():
+    gate = DataQualityGate()
+    # Good Data
+    is_valid, reason = gate.validate_snapshot({"spot": 21500.50, "vix": 14.2})
+    assert is_valid == True
+    assert reason == "OK"
+
+def test_validate_snapshot_zero_spot():
+    gate = DataQualityGate()
+    # Dangerous Data (Exchange Glitch)
+    is_valid, reason = gate.validate_snapshot({"spot": 0.0, "vix": 14.2})
+    assert is_valid == False
+    assert "Invalid Spot" in reason
+
+def test_validate_snapshot_negative_vix():
+    gate = DataQualityGate()
+    # Impossible Data
+    is_valid, reason = gate.validate_snapshot({"spot": 21500.0, "vix": -1.0})
+    assert is_valid == False
+    assert "Invalid VIX" in reason
+
+def test_validate_structure_empty():
+    gate = DataQualityGate()
+    # API returned empty chain
+    is_valid, reason = gate.validate_structure(pd.DataFrame())
+    assert is_valid == False
+    assert "Empty Chain" in reason
