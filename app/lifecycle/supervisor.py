@@ -14,6 +14,13 @@ from app.services.telegram_alerts import telegram_alerts
 from app.lifecycle.safety_controller import SafetyController, ExecutionMode
 from app.core.risk.capital_governor import CapitalGovernor
 from app.services.approval_system import ManualApprovalSystem
+from app.core.trading.exit_engine import ExitEngine
+from app.core.analytics.regime import RegimeEngine 
+from app.core.analytics.structure import StructureEngine
+from app.core.analytics.volatility import VolatilityEngine
+from app.core.analytics.edge import EdgeEngine
+from app.core.market.data_client import NIFTY_KEY, VIX_KEY
+from app.schemas.analytics import ExtMetrics
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -35,10 +42,21 @@ class ProductionTradingSupervisor:
         self.cap_governor = CapitalGovernor(total_capital=total_capital)
         self.approvals = ManualApprovalSystem()
         
+        # The Brain Components
+        self.exit_engine = ExitEngine()
+        self.regime_engine = RegimeEngine()
+        self.structure_engine = StructureEngine()
+        self.vol_engine = VolatilityEngine()
+        self.edge_engine = EdgeEngine()
+        
         self.interval = loop_interval_seconds
         self.running = False
         self.positions = {}
         self.cycle_counter = 0
+        
+        # Entry Cooldown
+        self.last_entry_time = 0
+        self.min_entry_interval = 300 # 5 Minutes
 
     async def start(self):
         logger.info(f"Supervisor Starting in {self.safety.execution_mode.value} mode...")
@@ -102,23 +120,86 @@ class ProductionTradingSupervisor:
 
                 # PHASE 4: DECISION ENGINE
                 adjs = []
-                net_delta = self._calc_net_delta()
                 
-                # A. Defensive Hedges
-                hedges = await self.adj.evaluate_portfolio(
-                    {"aggregate_metrics": {"delta": net_delta}}, snapshot
-                )
-                adjs.extend(hedges)
+                # A. CHECK EXITS FIRST
+                exits = await self.exit_engine.evaluate_exits(list(self.positions.values()), snapshot)
+                if exits:
+                    logger.info(f"[{cycle_id}] Exits Triggered: {len(exits)} orders")
+                    adjs.extend(exits)
                 
-                # B. Offensive Entries (Only if neutral/safe)
-                regime_name = "NEUTRAL"
-                can_add, _ = self.cap_governor.can_trade_new(150000, {})
-                
-                if not self.positions and not hedges and can_add:
-                    # In a real regime engine, this comes from regime.py. 
-                    pass 
-                
-                cycle_log['regime'] = regime_name
+                # Only look for new trades if we aren't frantically exiting
+                if not exits:
+                    net_delta = self._calc_net_delta()
+                    
+                    # B. Defensive Hedges
+                    hedges = await self.adj.evaluate_portfolio(
+                        {"aggregate_metrics": {"delta": net_delta}}, snapshot
+                    )
+                    adjs.extend(hedges)
+                    
+                    # C. Offensive Entries (Logic Enabled)
+                    can_add, cap_msg = self.cap_governor.can_trade_new(150000, {"strategy": "ENTRY"})
+                    
+                    # Cooldown Check
+                    time_since_last = time.time() - self.last_entry_time
+                    if time_since_last < self.min_entry_interval:
+                        can_add = False 
+
+                    regime_name = "NEUTRAL"
+                    
+                    # Only run heavy analytics if we are actually allowed to trade
+                    if not self.positions and not hedges and can_add:
+                        # 1. Fetch History & Chains (Heavy Lifting)
+                        logger.info(f"[{cycle_id}] Scanning for opportunities (Fetching History)...")
+                        
+                        expiry_date, mo_expiry, lot = await self.market.get_expiries_and_lot()
+                        
+                        if expiry_date:
+                            # Parallel Fetch
+                            t_nh = self.market.get_history(NIFTY_KEY)
+                            t_vh = self.market.get_history(VIX_KEY)
+                            t_wc = self.market.get_option_chain(expiry_date)
+                            t_mc = self.market.get_option_chain(mo_expiry) if mo_expiry else None
+                            
+                            nh, vh, wc = await asyncio.gather(t_nh, t_vh, t_wc)
+                            mc = await t_mc if t_mc else pd.DataFrame()
+                            
+                            if not nh.empty and not vh.empty and not wc.empty:
+                                # 2. Run The Brain (Real Logic)
+                                vol = await self.vol_engine.calculate_volatility(
+                                    nh, vh, snapshot['spot'], snapshot['vix']
+                                )
+                                
+                                st = self.structure_engine.analyze_structure(wc, snapshot['spot'], lot)
+                                ed = self.edge_engine.detect_edges(wc, mc, snapshot['spot'], vol)
+                                ext = ExtMetrics(0, 0, 0, [], False) # Still mocked as we don't have news feed
+                                
+                                # 3. Calculate Regime
+                                regime_result = self.regime_engine.calculate_regime(vol, st, ed, ext)
+                                
+                                regime_input = {
+                                    "name": regime_result.name,
+                                    "alloc_pct": regime_result.alloc_pct,
+                                    "max_lots": regime_result.max_lots
+                                }
+                                regime_name = regime_result.name
+                                
+                                # Log scores for debugging
+                                cycle_log['scores'] = {
+                                    "score": regime_result.score,
+                                    "vs": regime_result.v_scr,
+                                    "ss": regime_result.s_scr,
+                                    "es": regime_result.e_scr
+                                }
+
+                                if regime_name in ["AGGRESSIVE_SHORT", "MODERATE_SHORT"]:
+                                    logger.info(f"[{cycle_id}] Regime: {regime_name} (Score: {regime_result.score}) - Generating Orders")
+                                    entries = await self.engine.generate_entry_orders(regime_input, snapshot)
+                                    if entries:
+                                        self.last_entry_time = time.time()
+                                        adjs.extend(entries)
+
+                    cycle_log['regime'] = regime_name
 
                 # PHASE 5: EXECUTION GATEKEEPER
                 for adj in adjs:
@@ -130,8 +211,8 @@ class ProductionTradingSupervisor:
                         logger.error(f"Blocked by Safety: {safety_check['reason']}")
                         continue
                     
-                    # 2. Capital Check
-                    is_entry = adj.get('side') == 'SELL' and adj.get('quantity') > 0
+                    # 2. Capital Check (Entries only)
+                    is_entry = adj.get('action') == 'ENTRY'
                     if is_entry:
                         allowed, cap_msg = self.cap_governor.can_trade_new(150000, adj)
                         if not allowed:
@@ -172,14 +253,13 @@ class ProductionTradingSupervisor:
                 cycle_log['details']['exception'] = str(e)
                 
             finally:
-                # PHASE 6: JOURNALING (NON-BLOCKING FIX)
+                # PHASE 6: JOURNALING
                 asyncio.create_task(add_decision_log(cycle_log))
                 await self._sleep_rest(start_time)
 
     async def _read_data(self):
         spot = await self.market.get_spot_price()
         vix = await self.market.get_vix()
-        # Use live greeks from websocket if available
         greeks = self.ws.get_latest_greeks() if self.ws else {}
         return {"spot": spot, "vix": vix, "live_greeks": greeks}
 
@@ -190,11 +270,15 @@ class ProductionTradingSupervisor:
         for p in raw_pos:
             t = self._calculate_time_to_expiry(p.get("expiry"))
             
-            # GREEKS CONSISTENCY FIX
-            if p.get('greeks') and p['greeks'].get('delta') and p['greeks'].get('delta') != 0:
-                pass # Broker greeks exist
+            broker_greeks = p.get('greeks', {})
+            has_valid_delta = (
+                'delta' in broker_greeks and 
+                broker_greeks['delta'] is not None
+            )
+            
+            if has_valid_delta:
+                pass 
             else:
-                # Fallback to internal engine
                 p['greeks'] = self.risk.calculate_leg_greeks(
                     p['current_price'], snapshot['spot'], p.get("strike", 0), t, 
                     0.06, p.get("option_type", "CE")
