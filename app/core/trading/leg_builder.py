@@ -1,132 +1,207 @@
+# app/core/trading/leg_builder.py
+
 import pandas as pd
 import logging
 from typing import List, Dict, Optional
+
 from app.core.trading.strategies import StrategyDefinition
 
 logger = logging.getLogger(__name__)
 
+
 class LegBuilder:
     """
-    Converts StrategyDefinitions into concrete Option Legs.
-    Responsible for Strike Selection, Ratios, and Hedge Tagging.
+    LegBuilder converts an abstract StrategyDefinition
+    into concrete option orders.
+
+    HARD RULES:
+    - Accepts LOTS, never quantities
+    - Converts LOTS -> quantity exactly once
+    - Never decides risk, size, or strategy
     """
-    
-    def build_legs(self, 
-                   strategy: StrategyDefinition, 
-                   chain: pd.DataFrame, 
-                   lot_size: int) -> List[Dict]:
-        
-        orders = []
+
+    def build_legs(
+        self,
+        strategy: StrategyDefinition,
+        chain: pd.DataFrame,
+        lots: int
+    ) -> List[Dict]:
+
+        if lots <= 0:
+            logger.error("Invalid lots passed to LegBuilder")
+            return []
+
+        orders: List[Dict] = []
+
+        # ======================================================
+        # Helpers
+        # ======================================================
+        def pick(delta: float, opt_type: str) -> Optional[Dict]:
+            return self._select_strike_by_delta(chain, delta, opt_type)
+
+        def add_order(leg, side, ratio=1, is_hedge=False):
+            if not leg:
+                return
+            orders.append({
+                "action": "ENTRY",
+                "instrument_key": leg["instrument_key"],
+                "side": side,
+                "quantity": int(lots * ratio),
+                "strategy": strategy.name,
+                "is_hedge": is_hedge,
+                "reason": f"Δ {leg['delta']:.2f} ({'HEDGE' if is_hedge else 'CORE'})"
+            })
+
         structure = strategy.structure
-        
-        # Helper to find strike by delta
-        def find_leg(target_delta, leg_type):
-            return self._select_strike_by_delta(chain, leg_type, target_delta)
 
-        # ----------------------------------------
-        # LOGIC: CONDOR / FLY / STRANGLE (Symmetrical-ish)
-        # ----------------------------------------
-        if structure in ["CONDOR", "FLY", "STRANGLE", "CONDOR_BWB"]:
-            # 1. CORE LEGS (The Shorts)
-            # Expecting [CallDelta, PutDelta] e.g. [0.25, -0.25]
-            if len(strategy.core_deltas) >= 1:
-                ce_core = find_leg(strategy.core_deltas[0], "CE")
-                if ce_core:
-                    orders.append(self._make_order(ce_core, "SELL", strategy.name, lot_size, is_hedge=False))
-            
-            if len(strategy.core_deltas) >= 2:
-                pe_core = find_leg(strategy.core_deltas[1], "PE")
-                if pe_core:
-                    orders.append(self._make_order(pe_core, "SELL", strategy.name, lot_size, is_hedge=False))
+        # ======================================================
+        # CONDOR / STRANGLE / FLY
+        # ======================================================
+        if structure in ("CONDOR", "STRANGLE", "FLY"):
 
-            # 2. HEDGE LEGS (The Wings - Longs)
-            # Expecting [CallHedge, PutHedge] e.g. [0.05, -0.05]
-            if len(strategy.hedge_deltas) >= 1:
-                ce_hedge = find_leg(strategy.hedge_deltas[0], "CE")
-                if ce_hedge:
-                    orders.append(self._make_order(ce_hedge, "BUY", strategy.name, lot_size, is_hedge=True))
-            
-            if len(strategy.hedge_deltas) >= 2:
-                pe_hedge = find_leg(strategy.hedge_deltas[1], "PE")
-                if pe_hedge:
-                    orders.append(self._make_order(pe_hedge, "BUY", strategy.name, lot_size, is_hedge=True))
+            # --- CORE (Short)
+            ce_core = pick(strategy.core_deltas[0], "CE")
+            pe_core = pick(strategy.core_deltas[1], "PE")
 
-        # ----------------------------------------
-        # LOGIC: SPREAD (Directional)
-        # ----------------------------------------
+            add_order(ce_core, "SELL")
+            add_order(pe_core, "SELL")
+
+            # --- HEDGES (Long)
+            if strategy.risk_type == "DEFINED":
+                ce_hedge = pick(strategy.hedge_deltas[0], "CE")
+                pe_hedge = pick(strategy.hedge_deltas[1], "PE")
+
+                add_order(ce_hedge, "BUY", is_hedge=True)
+                add_order(pe_hedge, "BUY", is_hedge=True)
+
+        # ======================================================
+        # BROKEN WING CONDOR (ASYMMETRIC)
+        # ======================================================
+        elif structure == "CONDOR_BWB":
+
+            # Core shorts
+            ce_core = pick(strategy.core_deltas[0], "CE")
+            pe_core = pick(strategy.core_deltas[1], "PE")
+
+            add_order(ce_core, "SELL")
+            add_order(pe_core, "SELL")
+
+            # Asymmetric wings
+            ce_hedge = pick(strategy.hedge_deltas[0], "CE")
+            pe_hedge = pick(strategy.hedge_deltas[1], "PE")
+
+            # One wing closer, one further (true BWB)
+            add_order(ce_hedge, "BUY", is_hedge=True)
+            add_order(pe_hedge, "BUY", is_hedge=True)
+
+        # ======================================================
+        # VERTICAL SPREAD
+        # ======================================================
         elif structure == "SPREAD":
-            # Core is Short, Hedge is Long
-            # Put Credit Spread: Core=[-0.25], Hedge=[-0.10]
-            if strategy.core_deltas:
-                core = find_leg(strategy.core_deltas[0], "PE" if strategy.core_deltas[0] < 0 else "CE")
-                if core: orders.append(self._make_order(core, "SELL", strategy.name, lot_size, False))
-            
-            if strategy.hedge_deltas:
-                hedge = find_leg(strategy.hedge_deltas[0], "PE" if strategy.hedge_deltas[0] < 0 else "CE")
-                if hedge: orders.append(self._make_order(hedge, "BUY", strategy.name, lot_size, True))
 
-        # ----------------------------------------
-        # LOGIC: RATIO (Complex)
-        # ----------------------------------------
+            core_delta = strategy.core_deltas[0]
+            hedge_delta = strategy.hedge_deltas[0]
+
+            opt_type = "PE" if core_delta < 0 else "CE"
+
+            core = pick(core_delta, opt_type)
+            hedge = pick(hedge_delta, opt_type)
+
+            add_order(core, "SELL")
+            add_order(hedge, "BUY", is_hedge=True)
+
+        # ======================================================
+        # RATIO SPREAD (1x2 etc.)
+        # ======================================================
         elif structure == "RATIO":
-            # Example: 1x2 Put Spread
-            # Core Deltas: [-0.30, -0.15] -> Buy 0.30, Sell 0.15
-            # This logic requires specific mapping.
-            # Convention for Ratio in this system: 
-            # Index 0 = Long (The '1' in 1x2), Index 1 = Short (The '2' in 1x2)
-            
-            if len(strategy.core_deltas) >= 2:
-                # Leg 1: Long (Buy)
-                leg1 = find_leg(strategy.core_deltas[0], "PE" if strategy.core_deltas[0] < 0 else "CE")
-                qty1 = lot_size * strategy.ratios[0]
-                if leg1: orders.append(self._make_order(leg1, "BUY", strategy.name, qty1, False))
-                
-                # Leg 2: Short (Sell)
-                leg2 = find_leg(strategy.core_deltas[1], "PE" if strategy.core_deltas[1] < 0 else "CE")
-                qty2 = lot_size * strategy.ratios[1]
-                if leg2: orders.append(self._make_order(leg2, "SELL", strategy.name, qty2, False))
 
-        # ----------------------------------------
-        # SORTING: HEDGE FIRST
-        # ----------------------------------------
-        # Ensure Buys (Hedges) come before Sells to margin benefit
-        orders.sort(key=lambda x: 0 if x['side'] == 'BUY' else 1)
-        
+            # Convention:
+            # ratios = [long_ratio, short_ratio]
+            long_delta, short_delta = strategy.core_deltas
+            long_ratio, short_ratio = strategy.ratios
+
+            opt_type = "PE" if long_delta < 0 else "CE"
+
+            long_leg = pick(long_delta, opt_type)
+            short_leg = pick(short_delta, opt_type)
+
+            add_order(long_leg, "BUY", ratio=long_ratio)
+            add_order(short_leg, "SELL", ratio=short_ratio)
+
+        else:
+            logger.error(f"Unknown strategy structure: {structure}")
+            return []
+
+        # ======================================================
+        # FINAL SANITY CHECK
+        # ======================================================
+        if not self._validate_structure(orders, strategy):
+            logger.error("LegBuilder validation failed")
+            return []
+
+        # BUY first for margin benefit
+        orders.sort(key=lambda o: 0 if o["side"] == "BUY" else 1)
+
         return orders
 
-    def _select_strike_by_delta(self, chain: pd.DataFrame, option_type: str, target_delta: float) -> Optional[Dict]:
+    # ==========================================================
+    # Internal helpers
+    # ==========================================================
+
+    def _select_strike_by_delta(
+        self,
+        chain: pd.DataFrame,
+        target_delta: float,
+        option_type: str
+    ) -> Optional[Dict]:
+
         try:
-            if option_type == 'CE':
-                df = chain[['strike', 'ce_key', 'ce_delta']].copy()
-                df.columns = ['strike', 'key', 'delta']
+            if option_type == "CE":
+                df = chain[["strike", "ce_key", "ce_delta"]].rename(
+                    columns={"ce_key": "key", "ce_delta": "delta"}
+                )
             else:
-                df = chain[['strike', 'pe_key', 'pe_delta']].copy()
-                df.columns = ['strike', 'key', 'delta']
+                df = chain[["strike", "pe_key", "pe_delta"]].rename(
+                    columns={"pe_key": "key", "pe_delta": "delta"}
+                )
 
-            # Clean data
-            df = df[(df['delta'] != 0) & (df['delta'].notna())]
-            if df.empty: return None
+            df = df[df["delta"].notna() & (df["delta"] != 0)]
+            if df.empty:
+                return None
 
-            # Find closest
-            df['diff'] = (df['delta'] - target_delta).abs()
-            best = df.loc[df['diff'].idxmin()]
-            
+            df["diff"] = (df["delta"] - target_delta).abs()
+            best = df.loc[df["diff"].idxmin()]
+
             return {
-                "instrument_key": best['key'],
-                "strike": best['strike'],
-                "delta": best['delta']
+                "instrument_key": best["key"],
+                "strike": best["strike"],
+                "delta": best["delta"]
             }
+
         except Exception as e:
-            logger.error(f"Leg Selection Error: {e}")
+            logger.exception("Strike selection failed")
             return None
 
-    def _make_order(self, leg_data, side, tag, qty, is_hedge):
-        return {
-            "action": "ENTRY",
-            "instrument_key": leg_data['instrument_key'],
-            "quantity": int(qty),
-            "side": side,
-            "strategy": tag,
-            "is_hedge": is_hedge,
-            "reason": f"Delta {leg_data['delta']:.2f} ({'Hedge' if is_hedge else 'Core'})"
-        }
+    def _validate_structure(
+        self,
+        orders: List[Dict],
+        strategy: StrategyDefinition
+    ) -> bool:
+
+        if len(orders) < 2:
+            return False
+
+        sells = [o for o in orders if o["side"] == "SELL"]
+        buys = [o for o in orders if o["side"] == "BUY"]
+
+        if not sells:
+            return False
+
+        if strategy.risk_type == "DEFINED" and not buys:
+            return False
+
+        for o in orders:
+            if o["quantity"] <= 0:
+                return False
+
+        return True
