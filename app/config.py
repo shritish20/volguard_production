@@ -5,23 +5,25 @@ from typing import Optional, List, Union
 class Settings(BaseSettings):
     # Project Info
     PROJECT_NAME: str = "VolGuard Algorithmic Trading"
-    VERSION: str = "1.0.0"
+    VERSION: str = "1.1.0"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = "production"
     DEBUG: bool = False
 
-    # Security (NEW: Dedicated Admin Key)
+    # Security
     ADMIN_SECRET: str = "change_this_to_something_secure"
 
-    # Telegram Alerts (NEW)
+    # Telegram Alerts
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
-    # Upstox Credentials
+    # Upstox Credentials & Auto-Login
     UPSTOX_ACCESS_TOKEN: str
     UPSTOX_API_KEY: Optional[str] = None
     UPSTOX_API_SECRET: Optional[str] = None
     UPSTOX_REDIRECT_URI: Optional[str] = None
+    UPSTOX_CLIENT_ID: Optional[str] = None
+    UPSTOX_CLIENT_SECRET: Optional[str] = None
     
     # Upstox Endpoints
     UPSTOX_BASE_V2: str = "https://api.upstox.com/v2"
@@ -70,7 +72,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
-        extra = "ignore" # Ignore extra fields in .env to prevent crashes
+        extra = "ignore" 
 
     def model_post_init(self, __context):
         if not self.DATABASE_URL:
