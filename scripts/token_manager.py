@@ -54,7 +54,7 @@ def fetch_access_token():
         
         if response.status_code == 200:
             resp_json = response.json()
-            # Handle different response structures
+            # Handle possible response structures
             token = resp_json.get("access_token") or resp_json.get("data", {}).get("access_token")
             
             if token:
