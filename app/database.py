@@ -1,72 +1,96 @@
+# app/database.py
+
 from sqlalchemy import Column, String, Float, DateTime, Integer, JSON, Boolean, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from datetime import datetime
 import uuid
+import logging
 from app.config import settings
 
-# Async Engine
-engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------
+# ASYNC ENGINE (Production Safe Defaults)
+# --------------------------------------------------
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    pool_size=5,          # Prevent connection starvation
+    max_overflow=10,      # Burst tolerance
+    pool_recycle=1800     # Avoid stale connections
+)
+
+AsyncSessionLocal = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
 Base = declarative_base()
 
+# --------------------------------------------------
+# TRADE RECORDS
+# --------------------------------------------------
 class TradeRecord(Base):
     """Immutable record of every trade execution"""
     __tablename__ = "trade_records"
 
     id = Column(String, primary_key=True, index=True)
-    trade_tag = Column(String, index=True)  # Upstox Order ID
-    
-    # Core Details
+    trade_tag = Column(String, index=True, nullable=False)
+
     instrument_key = Column(String, nullable=False)
     symbol = Column(String)
-    side = Column(String)      # BUY / SELL
-    quantity = Column(Integer)
-    price = Column(Float)      # Execution Price
-    
-    # Strategy & Risk Metadata
+    side = Column(String, nullable=False)      # BUY / SELL
+    quantity = Column(Integer, nullable=False)
+    price = Column(Float)
+
     strike = Column(Float, nullable=True)
     expiry = Column(DateTime, nullable=True)
     lot_size = Column(Integer, nullable=True)
     strategy = Column(String, default="MANUAL")
-    
-    # State
-    status = Column(String, default="OPEN") # OPEN, CLOSED, REJECTED
+
+    status = Column(String, default="OPEN")
     timestamp = Column(DateTime, default=datetime.utcnow)
-    
-    # Audit
-    reason = Column(Text, nullable=True)     # Why did we trade?
+
+    reason = Column(Text, nullable=True)
     entry_delta = Column(Float, nullable=True)
 
+# --------------------------------------------------
+# DECISION JOURNAL
+# --------------------------------------------------
 class DecisionJournal(Base):
     """
-    The 'Black Box Recorder'. 
-    Saves the full state of the brain every cycle, even if no trade occurred.
+    Black box recorder of every decision cycle.
     """
     __tablename__ = "decision_journal"
-    
+
     id = Column(String, primary_key=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    cycle_id = Column(String)
-    
-    # Market State
+    cycle_id = Column(String, nullable=False)
+
     spot_price = Column(Float)
     vix = Column(Float)
-    
-    # The "Why"
-    action_taken = Column(Boolean) # Did we do anything?
-    regime = Column(String)        # e.g., AGGRESSIVE_SHORT
-    scores = Column(JSON)          # {vol_score: 8.0, struct_score: 5.0...}
-    risks = Column(JSON)           # {delta: 0.1, gamma: 0.05}
-    
-    details = Column(JSON)         # Full dump of logic vars
 
+    action_taken = Column(Boolean)
+    regime = Column(String)
+    scores = Column(JSON)
+    risks = Column(JSON)
+
+    details = Column(JSON)
+
+# --------------------------------------------------
+# INITIALIZATION
+# --------------------------------------------------
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+# --------------------------------------------------
+# JOURNAL HELPER
+# --------------------------------------------------
 async def add_decision_log(cycle_data: dict):
-    """Helper to write to journal asynchronously"""
     async with AsyncSessionLocal() as session:
         try:
             log = DecisionJournal(
@@ -84,5 +108,5 @@ async def add_decision_log(cycle_data: dict):
             session.add(log)
             await session.commit()
         except Exception as e:
-            # We don't crash on logging failure, just print
-            print(f"Journal Error: {e}")
+            await session.rollback()
+            logger.error(f"Decision journal write failed: {e}")
