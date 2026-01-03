@@ -1,10 +1,7 @@
-# app/core/market/websocket_client.py
-
 import upstox_client
 import threading
 import logging
-import time
-from typing import List, Dict
+from typing import Dict, List
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -12,158 +9,166 @@ logger = logging.getLogger(__name__)
 
 class UpstoxFeedService:
     """
-    PRODUCTION-GRADE WebSocket Feed
-    - Auto reconnect
-    - Staleness detection
-    - Subscription recovery
-    - Fail-closed behavior
+    Upstox V3 Market Data WebSocket (OPTION GREEKS ONLY)
+
+    Design rules:
+    - Greeks are NON-AUTHORITATIVE
+    - Safe to fail silently
+    - Timestamp guarded
     """
 
-    STALE_AFTER_SECONDS = 15  # Greeks older than this are INVALID
+    MAX_STALENESS_SECONDS = 10  # Greeks older than this are ignored
 
     def __init__(self, access_token: str):
         self.config = upstox_client.Configuration()
         self.config.access_token = access_token
 
-        self.client = upstox_client.ApiClient(self.config)
+        self.api_client = upstox_client.ApiClient(self.config)
         self.streamer = None
 
-        self._lock = threading.RLock()
-        self._cache: Dict[str, Dict] = {}
-        self._subscriptions: List[str] = []
+        self._lock = threading.Lock()
+        self._greeks_cache: Dict[str, Dict] = {}
+        self._subscribed_keys: List[str] = []
 
-        self._connected = False
-        self._last_message_ts: float = 0.0
+        self.is_connected = False
 
     # ======================================================
-    # CONNECTION MANAGEMENT
+    # Connection Lifecycle
     # ======================================================
     async def connect(self):
-        """Initializes and connects websocket"""
         try:
-            self.streamer = upstox_client.MarketDataStreamerV3(self.client)
+            self.streamer = upstox_client.MarketDataStreamerV3(
+                self.api_client
+            )
 
             self.streamer.on("open", self._on_open)
             self.streamer.on("message", self._on_message)
             self.streamer.on("error", self._on_error)
-            self.streamer.on("close", self._on_close)
+            self.streamer.on("reconnecting", self._on_reconnecting)
+            self.streamer.on("autoReconnectStopped", self._on_reconnect_stopped)
 
-            # Aggressive reconnect (prod safe)
-            self.streamer.auto_reconnect(True, 5, 10)
-
+            # Conservative reconnect
+            self.streamer.auto_reconnect(True, 10, 5)
             self.streamer.connect()
-            logger.info("WebSocket connect initiated")
+
+            logger.info("Upstox WebSocket connect initiated")
 
         except Exception as e:
-            logger.critical(f"WebSocket connect failed: {e}")
-            self._connected = False
+            logger.error(f"WebSocket connect failed: {e}")
 
     async def disconnect(self):
-        """Graceful shutdown"""
         try:
             if self.streamer:
                 self.streamer.disconnect()
-        except Exception as e:
-            logger.warning(f"WebSocket disconnect error: {e}")
-        finally:
-            self._connected = False
+            self.is_connected = False
+            logger.info("Upstox WebSocket disconnected")
+        except Exception:
+            pass
 
     # ======================================================
-    # SUBSCRIPTIONS
+    # Subscription Management
     # ======================================================
-    def update_subscriptions(self, keys: List[str]):
+    def subscribe(self, instrument_keys: List[str]):
         """
+        Subscribe to option greeks.
         Safe to call multiple times.
-        Subscriptions are restored after reconnects.
         """
-        if not keys:
+        if not instrument_keys:
             return
 
         with self._lock:
-            self._subscriptions = list(set(keys))
+            self._subscribed_keys = list(set(instrument_keys))
 
-        if self.streamer and self._connected:
+        if self.streamer and self.is_connected:
             try:
-                self.streamer.subscribe(self._subscriptions, "option_greeks")
-                logger.info(f"Subscribed to {len(self._subscriptions)} instruments")
+                self.streamer.subscribe(
+                    self._subscribed_keys,
+                    "option_greeks"
+                )
+                logger.info(f"Subscribed to {len(self._subscribed_keys)} instruments (greeks)")
             except Exception as e:
                 logger.error(f"Subscription failed: {e}")
 
-    # ======================================================
-    # DATA ACCESS (FAIL-CLOSED)
-    # ======================================================
-    def get_latest_greeks(self) -> Dict:
-        """
-        Returns ONLY FRESH greeks.
-        Stale data is automatically dropped.
-        """
-        now = datetime.utcnow()
+    def unsubscribe_all(self):
+        if self.streamer and self._subscribed_keys:
+            try:
+                self.streamer.unsubscribe(self._subscribed_keys)
+            except Exception:
+                pass
 
         with self._lock:
-            fresh = {}
-            for k, v in self._cache.items():
+            self._subscribed_keys = []
+            self._greeks_cache.clear()
+
+    # ======================================================
+    # Public API
+    # ======================================================
+    def get_latest_greeks(self) -> Dict[str, Dict]:
+        """
+        Returns ONLY fresh greeks.
+        Stale entries are automatically dropped.
+        """
+        now = datetime.utcnow()
+        fresh = {}
+
+        with self._lock:
+            for k, v in self._greeks_cache.items():
                 ts = v.get("timestamp")
                 if not ts:
                     continue
 
-                age = (now - ts).total_seconds()
-                if age <= self.STALE_AFTER_SECONDS:
+                if (now - ts).total_seconds() <= self.MAX_STALENESS_SECONDS:
                     fresh[k] = v
 
-            return fresh
-
-    def is_healthy(self) -> bool:
-        """
-        Health check for supervisor / monitoring
-        """
-        if not self._connected:
-            return False
-        if time.time() - self._last_message_ts > self.STALE_AFTER_SECONDS:
-            return False
-        return True
+        return fresh
 
     # ======================================================
-    # EVENT HANDLERS
+    # WebSocket Event Handlers
     # ======================================================
     def _on_open(self):
-        logger.info("WebSocket connected")
-        self._connected = True
+        logger.info("Upstox WebSocket connected")
+        self.is_connected = True
 
-        # Restore subscriptions after reconnect
-        if self._subscriptions:
+        # Re-subscribe after reconnect
+        if self._subscribed_keys:
             try:
-                self.streamer.subscribe(self._subscriptions, "option_greeks")
-                logger.info("Subscriptions restored after reconnect")
-            except Exception as e:
-                logger.error(f"Resubscribe failed: {e}")
+                self.streamer.subscribe(
+                    self._subscribed_keys,
+                    "option_greeks"
+                )
+                logger.info("Re-subscribed after reconnect")
+            except Exception:
+                pass
 
-    def _on_close(self, code=None, reason=None):
-        logger.warning(f"WebSocket closed ({code}): {reason}")
-        self._connected = False
-
-    def _on_error(self, error):
-        logger.error(f"WebSocket error: {error}")
-        self._connected = False
-
-    def _on_message(self, msg):
+    def _on_message(self, message):
         try:
-            feeds = msg.get("feeds", {})
+            feeds = message.get("feeds", {})
             now = datetime.utcnow()
 
             with self._lock:
-                for k, v in feeds.items():
-                    og = v.get("og", {})
+                for instrument_key, payload in feeds.items():
+                    og = payload.get("og")
                     if not og:
                         continue
 
-                    self._cache[k] = {
+                    self._greeks_cache[instrument_key] = {
                         "delta": og.get("delta", 0.0),
                         "gamma": og.get("gamma", 0.0),
                         "iv": og.get("iv", 0.0),
-                        "timestamp": now,
+                        "timestamp": now
                     }
 
-                self._last_message_ts = time.time()
+        except Exception:
+            # NEVER crash supervisor due to WS noise
+            pass
 
-        except Exception as e:
-            logger.exception(f"WebSocket message parse error: {e}")
+    def _on_error(self, error):
+        logger.error(f"WebSocket error: {error}")
+
+    def _on_reconnecting(self, msg):
+        logger.warning(f"WebSocket reconnecting: {msg}")
+        self.is_connected = False
+
+    def _on_reconnect_stopped(self, msg):
+        logger.critical(f"WebSocket auto-reconnect stopped: {msg}")
+        self.is_connected = False
