@@ -6,17 +6,17 @@ from urllib.parse import quote
 from collections import defaultdict
 from typing import List, Tuple, Dict, Optional
 import logging
+from app.config import settings
 
-# [span_2](start_span)[span_3](start_span)Derived from[span_2](end_span)[span_3](end_span)
 logger = logging.getLogger(__name__)
 
+# Constants from your file
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
 VIX_KEY = "NSE_INDEX|India VIX"
 
 class MarketDataClient:
     """
-    Production Async Client for Upstox.
-    Handles Historical Data, Live Quotes, and Option Chains.
+    Aligned with AsyncFetcher logic from Ana_260102_191309.txt
     """
     def __init__(self, access_token: str, base_url_v2: str, base_url_v3: str):
         self.headers = {
@@ -31,12 +31,12 @@ class MarketDataClient:
     async def close(self):
         await self.client.aclose()
 
-    async def get_history(self, key: str, days: int = 400) -> pd.DataFrame:
-        [span_4](start_span)"""Fetch historical candles for volatility calculations[span_4](end_span)"""
+    # Exact Logic from Source 566
+    async def get_history(self, key: str, d: int = 400) -> pd.DataFrame:
         try:
             edu = quote(key, safe='')
             td = date.today().strftime("%Y-%m-%d")
-            fd = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+            fd = (date.today() - timedelta(days=d)).strftime("%Y-%m-%d")
             
             url = f"{self.base_v2}/historical-candle/{edu}/day/{td}/{fd}"
             resp = await self.client.get(url)
@@ -52,8 +52,8 @@ class MarketDataClient:
             logger.error(f"Error fetching history for {key}: {str(e)}")
         return pd.DataFrame()
 
+    # Exact Logic from Source 569 (renamed to get_live_quote to match Supervisor)
     async def get_live_quote(self, keys: List[str]) -> Dict[str, float]:
-        [span_5](start_span)"""Fetch live LTP[span_5](end_span)"""
         try:
             params = {"instrument_key": ",".join(keys)}
             resp = await self.client.get(f"{self.base_v3}/market-quote/ltp", params=params)
@@ -69,8 +69,8 @@ class MarketDataClient:
             logger.error(f"Error fetching live quotes: {str(e)}")
         return {}
 
+    # Exact Logic from Source 571
     async def get_expiries_and_lot(self) -> Tuple[Optional[str], Optional[str], int]:
-        [span_6](start_span)"""Get Current Week and Month expiries + Lot size[span_6](end_span)"""
         try:
             resp = await self.client.get(f"{self.base_v2}/option/contract", params={"instrument_key": NIFTY_KEY})
             if resp.status_code == 200:
@@ -88,28 +88,30 @@ class MarketDataClient:
                 for x in dates: mmap[(x.year, x.month)].append(x)
                 
                 curr_month_dates = mmap[(date.today().year, date.today().month)]
+                
                 if curr_month_dates and max(curr_month_dates) >= date.today():
                     mo = max(curr_month_dates)
                 else:
                     ny = date.today().year + (1 if date.today().month == 12 else 0)
                     nm = 1 if date.today().month == 12 else date.today().month + 1
-                    mo = max(mmap[(ny, nm)]) if mmap.get((ny, nm)) else wk
+                    mo = max(mmap[(ny, nm)]) if mmap[(ny, nm)] else wk
                 
                 return wk.strftime("%Y-%m-%d"), mo.strftime("%Y-%m-%d"), lot
         except Exception as e:
             logger.error(f"Error fetching expiries: {str(e)}")
         return None, None, 0
 
-    async def fetch_chain_data(self, expiry: str) -> pd.DataFrame:
-        [span_7](start_span)"""Fetch option chain and extract Greeks + Keys[span_7](end_span)"""
+    # Exact Logic from Source 577
+    async def get_option_chain(self, exp: str) -> pd.DataFrame:
         try:
-            params = {"instrument_key": NIFTY_KEY, "expiry_date": expiry}
+            params = {"instrument_key": NIFTY_KEY, "expiry_date": exp}
             resp = await self.client.get(f"{self.base_v2}/option/chain", params=params)
             
             if resp.status_code == 200:
                 data = resp.json().get('data', [])
                 return pd.DataFrame([{
                     'strike': x['strike_price'],
+                    # Key preservation for Executor
                     'ce_key': x['call_options']['instrument_key'],
                     'pe_key': x['put_options']['instrument_key'],
                     'ce_iv': x['call_options']['option_greeks']['iv'], 
@@ -122,36 +124,14 @@ class MarketDataClient:
                     'pe_oi': x['put_options']['market_data']['oi'],
                 } for x in data])
         except Exception as e:
-            logger.error(f"Error fetching chain for {expiry}: {str(e)}")
+            logger.error(f"Error fetching chain for {exp}: {str(e)}")
         return pd.DataFrame()
 
-    # --- Supervisor Helper Methods ---
-    
+    # --- Helpers required by Supervisor (Not in your brain file, but needed for system to work) ---
     async def get_spot_price(self) -> float:
-        """Helper for Supervisor"""
         quotes = await self.get_live_quote([NIFTY_KEY])
         return quotes.get(NIFTY_KEY, 0.0)
 
     async def get_vix(self) -> float:
-        """Helper for Supervisor"""
         quotes = await self.get_live_quote([VIX_KEY])
         return quotes.get(VIX_KEY, 0.0)
-    
-    async def get_active_option_instruments(self) -> List[str]:
-        """Get active strike keys for WebSocket subscription"""
-        try:
-            spot = await self.get_spot_price()
-            wk, _, _ = await self.get_expiries_and_lot()
-            if not wk or spot == 0: return [NIFTY_KEY, VIX_KEY]
-            
-            chain = await self.fetch_chain_data(wk)
-            if chain.empty: return [NIFTY_KEY, VIX_KEY]
-            
-            # Select 20 strikes around ATM
-            nearby = chain.iloc[(chain['strike'] - spot).abs().argsort()[:20]]
-            keys = [NIFTY_KEY, VIX_KEY]
-            keys.extend(nearby['ce_key'].tolist())
-            keys.extend(nearby['pe_key'].tolist())
-            return keys
-        except:
-            return [NIFTY_KEY, VIX_KEY]
