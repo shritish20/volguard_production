@@ -41,20 +41,13 @@ class AdjustmentEngine:
             details = registry.get_instrument_details(fut_key)
             lot_size = details.get('lot_size', 50)
             
-            # 3. SMART HEDGING LOGIC
-            # Goal: Bring Delta to 0. 
-            # Future Delta per unit approx 1.0.
-            # Delta to remove = current_delta
-            # Qty = -current_delta / 1.0
-            
+            # 3. SMART HEDGING LOGIC: Snap to nearest lot
             target_qty = -current_delta
-            
-            # Snap to nearest lot
             lots_needed = round(target_qty / lot_size)
             qty_needed = abs(lots_needed * lot_size)
             
             if qty_needed == 0:
-                return [] # Breach is too small to hedge with 1 lot
+                return [] 
 
             side = "BUY" if lots_needed > 0 else "SELL"
             
