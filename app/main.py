@@ -1,96 +1,56 @@
-"""
-FastAPI application entry point.
-"""
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import logging
 import uvicorn
 
 from app.config import settings
-from app.database import engine
+from app.database import engine, init_db
 from app.api.v1.router import router as api_router
-from app.utils.logging import setup_logging
-
-# Setup logging
-logger = setup_logging()
+# app.utils.logging logic can be simple here since run_production handles the main logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager for startup/shutdown"""
-    # Startup
-    logger.info("🚀 Starting VolGuard Trading System...")
+    logger.info("Starting VolGuard API...")
     
-    # Initialize database
-    await engine.connect()
-    
-    # Create tables (in production, use Alembic)
-    from app.database import Base
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    logger.info("✅ VolGuard Trading System started successfully")
+    # Initialize DB (Creates tables if missing)
+    await init_db()
     
     yield
     
-    # Shutdown
-    logger.info("🛑 Shutting down VolGuard Trading System...")
-    await engine.disconnect()
-    logger.info("✅ Shutdown complete")
+    logger.info("Shutting down VolGuard API...")
+    await engine.dispose()
 
 def create_app() -> FastAPI:
-    """Application factory"""
     app = FastAPI(
-        title=settings.API_TITLE,
-        version=settings.API_VERSION,
-        lifespan=lifespan,
-        docs_url="/docs" if settings.DEBUG else None,
-        redoc_url="/redoc" if settings.DEBUG else None,
-        openapi_url="/openapi.json" if settings.DEBUG else None
+        title=settings.PROJECT_NAME,
+        version=settings.VERSION,
+        openapi_url=f"{settings.API_V1_STR}/openapi.json",
+        lifespan=lifespan
     )
-    
+
     # Middleware
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_origins=["*"], # Tighten this for real production
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=["*"] if settings.DEBUG else settings.ALLOWED_ORIGINS
-    )
-    
+
     # Routers
-    app.include_router(api_router, prefix=settings.API_PREFIX)
-    
-    # Health check
+    app.include_router(api_router, prefix=settings.API_V1_STR)
+
     @app.get("/health")
     async def health_check():
-        return {
-            "status": "healthy",
-            "service": "volguard",
-            "environment": settings.ENVIRONMENT,
-            "timestamp": "now"
-        }
-    
-    # Metrics endpoint
-    @app.get("/metrics")
-    async def metrics():
-        return {"message": "Prometheus metrics endpoint"}
-    
+        return {"status": "healthy", "env": "production"}
+
     return app
 
 app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.DEBUG,
-        log_level="info" if not settings.DEBUG else "debug"
-    )
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
