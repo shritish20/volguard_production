@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     # Security (NEW: Dedicated Admin Key)
     ADMIN_SECRET: str = "change_this_to_something_secure"
 
+    # Telegram Alerts (NEW)
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
+    TELEGRAM_CHAT_ID: Optional[str] = None
+
     # Upstox Credentials
     UPSTOX_ACCESS_TOKEN: str
     UPSTOX_API_KEY: Optional[str] = None
