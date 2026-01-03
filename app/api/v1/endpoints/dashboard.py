@@ -1,7 +1,7 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException
 from datetime import datetime
-from app.config import settings, NIFTY_KEY, VIX_KEY
-from app.core.market.data_client import MarketDataClient
+from app.config import settings
+from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.structure import StructureEngine
 from app.core.analytics.edge import EdgeEngine
@@ -13,12 +13,13 @@ from app.schemas.analytics import (
 import asyncio
 import logging
 
+# [span_29](start_span)[span_30](start_span)Derived from[span_29](end_span)[span_30](end_span)
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# --- Helper for Frontend Tags ---
+# -[span_31](start_span)-- Helper for Frontend Tags[span_31](end_span) ---
 def get_tag_meta(val, type_):
-    [span_7](start_span)"""Visual tagging logic for frontend[span_7](end_span)"""
     if type_ == "IVP":
         if val < 20: return "CHEAP", "green"
         if val > 80: return "RICH", "red"
@@ -31,8 +32,6 @@ def get_tag_meta(val, type_):
         return ("HIGH", "red") if val > 100 else ("STABLE", "default")
     if type_ == "TERM":
         return ("INV", "red") if val < 0 else ("NRML", "green")
-    if type_ == "SKEW":
-        return "-", "default"
     return "-", "default"
 
 def mk_item(val, type_tag=None, suffix=""):
@@ -42,24 +41,19 @@ def mk_item(val, type_tag=None, suffix=""):
 
 @router.post("/analyze", response_model=FullAnalysisResponse)
 async def analyze_market_state():
-    """
-    On-demand full market analysis.
-    Orchestrates Data Client -> Engines -> Pydantic Response.
-    """
+    [span_32](start_span)"""On-demand full market analysis[span_32](end_span)"""
     client = MarketDataClient(
         settings.UPSTOX_ACCESS_TOKEN, 
         settings.UPSTOX_BASE_V2, 
         settings.UPSTOX_BASE_V3
     )
-    
-    # Initialize Engines
     vol_engine = VolatilityEngine()
     struct_engine = StructureEngine()
     edge_engine = EdgeEngine()
     regime_engine = RegimeEngine()
     
     try:
-        # 1. [span_8](start_span)Parallel Data Fetching[span_8](end_span)
+        # 1. [span_33](start_span)Parallel Data Fetching[span_33](end_span)
         task_nh = client.get_history(NIFTY_KEY)
         task_vh = client.get_history(VIX_KEY)
         task_live = client.get_live_quote([NIFTY_KEY, VIX_KEY])
@@ -72,10 +66,9 @@ async def analyze_market_state():
         if nh.empty or not we:
             raise HTTPException(status_code=500, detail="Data Fetch Failed")
 
-        # Fetch chains
         wc, mc = await asyncio.gather(client.fetch_chain_data(we), client.fetch_chain_data(me))
         
-        # 2. Logic Calculation
+        # 2. [span_34](start_span)Logic Calculation[span_34](end_span)
         spot_val = live_data.get(NIFTY_KEY, 0)
         vix_val = live_data.get(VIX_KEY, 0)
         
@@ -83,7 +76,7 @@ async def analyze_market_state():
         st = struct_engine.analyze_structure(wc, vol.spot, lot)
         ed = edge_engine.detect_edges(wc, mc, vol.spot, vol)
         
-        # External Metrics (Mock/Hardcoded for now as per Source 2)
+        # External Metrics (Mock)
         fast = False
         if len(nh) > 0:
             l = nh.iloc[-1]
@@ -92,7 +85,7 @@ async def analyze_market_state():
         ext = ExtMetrics(1500, -500, 1, ["RBI Policy"], fast)
         reg = regime_engine.calculate_regime(vol, st, ed, ext)
         
-        # 3. [span_9](start_span)Response Construction[span_9](end_span)
+        # 3. [span_35](start_span)Response Construction[span_35](end_span)
         return FullAnalysisResponse(
             timestamp=datetime.now(),
             volatility=VolatilityDashboard(
@@ -131,12 +124,7 @@ async def analyze_market_state():
                 risk_score=reg.r_scr,
                 total_score=reg.score
             ),
-            external={
-                "fii_net": ext.fii,
-                "dii_net": ext.dii,
-                "events": ext.events,
-                "fast_vol": ext.fast_vol
-            },
+            external={"fii_net": ext.fii, "dii_net": ext.dii, "events": ext.events, "fast_vol": ext.fast_vol},
             capital=CapitalDashboard(
                 regime_name=reg.name,
                 primary_edge=reg.primary,
