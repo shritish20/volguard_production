@@ -2,6 +2,7 @@ import asyncio
 import time
 import logging
 import uuid
+import os
 from typing import Dict
 from datetime import datetime
 from app.services.instrument_registry import registry
@@ -38,6 +39,24 @@ class ProductionTradingSupervisor:
         self.running = True
         
         while self.running:
+            # --- PHASE 0: EMERGENCY OVERRIDE CHECK ---
+            # Checks for the physical 'KILL_SWITCH.TRIGGER' file created by admin script
+            if os.path.exists("KILL_SWITCH.TRIGGER"):
+                logger.critical("KILL SWITCH FILE DETECTED! ENTERING EMERGENCY SHUTDOWN.")
+                try:
+                    with open("KILL_SWITCH.TRIGGER", "r") as f:
+                        reason = f.read().strip()
+                except Exception:
+                    reason = "MANUAL_FILE_TRIGGER"
+                
+                # Execute Emergency Close
+                await self.exec.close_all_positions(reason)
+                
+                # Stop the loop and alert
+                self.running = False
+                await alert_service.send_alert("SYSTEM SHUTDOWN", f"Kill switch activated: {reason}", "EMERGENCY")
+                break
+
             cycle_id = str(uuid.uuid4())[:8]
             start_time = time.time()
             action_taken = False
