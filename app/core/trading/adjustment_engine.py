@@ -1,3 +1,5 @@
+# app/core/trading/adjustment_engine.py
+
 import logging
 import time
 from typing import List, Dict
@@ -5,65 +7,121 @@ from app.services.instrument_registry import registry
 
 logger = logging.getLogger(__name__)
 
+
 class AdjustmentEngine:
+    """
+    LAST LINE OF DEFENSE.
+    This engine exists ONLY to prevent catastrophic portfolio risk.
+    It must NEVER fight strategy intent or regime logic.
+    """
+
     def __init__(self, config: Dict):
         self.max_net_delta = config.get("MAX_NET_DELTA", 0.40)
-        self.max_daily_loss = config.get("MAX_DAILY_LOSS", 20000)
-        
-        # Anti-Whipsaw
+
+        # Only hedge at SEVERE breach
+        self.severe_multiplier = 1.75
+
+        # Anti-whipsaw
         self.last_adjustment_time = 0
-        self.min_adjustment_interval = 300 
-        self.delta_buffer = 0.05
+        self.min_adjustment_interval = 300  # seconds
 
-    async def evaluate_portfolio(self, portfolio_risk: Dict, market_snapshot: Dict) -> List[Dict]:
+    # --------------------------------------------------
+    # PORTFOLIO EVALUATION
+    # --------------------------------------------------
+    async def evaluate_portfolio(
+        self,
+        portfolio_risk: Dict,
+        market_snapshot: Dict,
+        regime: str = "NEUTRAL",
+        open_positions: List[Dict] = None,
+    ) -> List[Dict]:
+
         adjustments = []
+        open_positions = open_positions or []
+
         metrics = portfolio_risk.get("aggregate_metrics", {})
-        current_delta = metrics.get("delta", 0.0)
+        net_delta = metrics.get("delta", 0.0)
 
-        # 1. Cool-down Check
-        time_since_last = time.time() - self.last_adjustment_time
-        if time_since_last < self.min_adjustment_interval:
-            # Exception: Critical Breach (> 2x limit)
-            if abs(current_delta) < (self.max_net_delta * 2):
-                return []
+        # --------------------------------------------------
+        # 1️⃣ NOTHING TO DO IF NO POSITIONS
+        # --------------------------------------------------
+        if not open_positions:
+            return []
 
-        # 2. Delta Threshold Logic
-        threshold = self.max_net_delta + self.delta_buffer
-        
-        if abs(current_delta) > threshold:
-            logger.warning(f"Delta Breach: {current_delta:.2f} (Limit: {self.max_net_delta})")
+        # --------------------------------------------------
+        # 2️⃣ REGIME RESPECT
+        # --------------------------------------------------
+        if regime in ["LONG_VOL", "CASH", "STAY_AWAY"]:
+            return []
 
-            fut_key = registry.get_current_future("NIFTY")
-            if not fut_key:
-                logger.error("Cannot Hedge: No Future found")
-                return []
-            
-            details = registry.get_instrument_details(fut_key)
-            lot_size = details.get('lot_size', 50)
-            
-            # 3. SMART HEDGING LOGIC: Snap to nearest lot
-            target_qty = -current_delta
-            lots_needed = round(target_qty / lot_size)
-            qty_needed = abs(lots_needed * lot_size)
-            
-            if qty_needed == 0:
-                return [] 
+        # --------------------------------------------------
+        # 3️⃣ STRATEGY STRUCTURE CHECK
+        # If all positions are defined-risk, DO NOT hedge
+        # --------------------------------------------------
+        has_undefined_risk = any(
+            not p.get("is_hedge", False) and p.get("strategy") in ["SHORT_STRANGLE", "RATIO_PUT_SPREAD"]
+            for p in open_positions
+        )
 
-            side = "BUY" if lots_needed > 0 else "SELL"
-            
-            # 4. Construct Order
-            adjustments.append({
-                "action": "DELTA_HEDGE",
+        if not has_undefined_risk:
+            return []
+
+        # --------------------------------------------------
+        # 4️⃣ COOLDOWN CHECK
+        # --------------------------------------------------
+        if time.time() - self.last_adjustment_time < self.min_adjustment_interval:
+            return []
+
+        # --------------------------------------------------
+        # 5️⃣ SEVERE DELTA BREACH ONLY
+        # --------------------------------------------------
+        severe_limit = self.max_net_delta * self.severe_multiplier
+
+        if abs(net_delta) < severe_limit:
+            return []
+
+        logger.critical(
+            f"SEVERE DELTA BREACH: {net_delta:.2f} | Limit: {severe_limit:.2f}"
+        )
+
+        # --------------------------------------------------
+        # 6️⃣ FUTURE-BASED EMERGENCY HEDGE
+        # --------------------------------------------------
+        fut_key = registry.get_current_future("NIFTY")
+        if not fut_key:
+            logger.error("Emergency hedge failed: No NIFTY future available")
+            return []
+
+        details = registry.get_instrument_details(fut_key)
+        lot_size = details.get("lot_size", 50)
+
+        # Snap to nearest lot
+        target_qty = -net_delta
+        lots = round(target_qty / lot_size)
+        qty = abs(lots * lot_size)
+
+        if qty <= 0:
+            return []
+
+        side = "BUY" if lots > 0 else "SELL"
+
+        adjustments.append(
+            {
+                "action": "ENTRY",
                 "instrument_key": fut_key,
-                "quantity": qty_needed,
+                "quantity": qty,
                 "side": side,
                 "strategy": "HEDGE",
-                "reason": f"Delta {current_delta:.2f} exceeds limit. Hedging {qty_needed} qty."
-            })
-            
-            self.last_adjustment_time = time.time()
+                "reason": f"Emergency delta hedge | Net Δ={net_delta:.2f}",
+                "is_hedge": True,
+            }
+        )
 
+        self.last_adjustment_time = time.time()
         return adjustments
 
+    # --------------------------------------------------
+    # PLACEHOLDER (INTENTIONAL)
+    # --------------------------------------------------
     async def evaluate_trade(self, trade, risk, snap):
         return []
