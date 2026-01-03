@@ -1,124 +1,127 @@
-# app/core/trading/exit_engine.py
-
 import logging
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-
 class ExitEngine:
     """
-    Handles all exit decisions.
-    EXIT logic has higher priority than ENTRY in the Supervisor.
+    Exit-only engine.
+    No firefighting. No rolling. Clean exits only.
     """
 
     def __init__(
         self,
-        profit_target_pct: float = 0.70,
-        stop_loss_pct: float = 2.0,
-        min_dte: int = 7,
+        profit_target_pct: float = 0.70,   # 70% premium capture
+        stop_loss_pct: float = 2.0,        # 200% of collected premium
+        min_dte: int = 7,                  # Existing gamma safety
+        force_exit_dte: int = 1            # 🔒 NEW: Mandatory T-1 square-off
     ):
         self.profit_target = profit_target_pct
         self.stop_loss = stop_loss_pct
         self.min_dte = min_dte
+        self.force_exit_dte = force_exit_dte
 
-    # --------------------------------------------------
-    # EXIT EVALUATION
-    # --------------------------------------------------
     async def evaluate_exits(
         self,
         positions: List[Dict],
-        snapshot: Dict,
+        snapshot: Dict
     ) -> List[Dict]:
 
         exits = []
 
         for pos in positions:
             # Skip non-option instruments
-            if "average_price" not in pos or "FUT" in pos.get("symbol", ""):
+            if 'expiry' not in pos or 'average_price' not in pos:
                 continue
 
             qty = abs(pos.get("quantity", 0))
-            if qty <= 0:
+            if qty == 0:
                 continue
 
             entry_price = float(pos["average_price"])
-            current_price = float(pos["current_price"])
-            side = pos["side"]
+            current_price = float(pos.get("current_price", entry_price))
+            lot_size = pos.get("lot_size", 1)
+
+            entry_premium = entry_price * lot_size
+
+            # PnL per lot
+            if pos["side"] == "SELL":
+                pnl = (entry_price - current_price) * lot_size
+            else:
+                pnl = (current_price - entry_price) * lot_size
+
+            dte = self._days_to_expiry(pos.get("expiry"))
 
             # --------------------------------------------------
-            # UNIT-CONSISTENT PnL (per position)
+            # RULE 1: FORCE EXIT T-1 (ABSOLUTE)
             # --------------------------------------------------
-            if side == "SELL":
-                pnl = (entry_price - current_price) * qty
-                max_profit = entry_price * qty
-            else:  # BUY (HEDGE)
-                pnl = (current_price - entry_price) * qty
-                max_profit = None
-
-            # --------------------------------------------------
-            # 1️⃣ PROFIT TARGET (SELLERS ONLY)
-            # --------------------------------------------------
-            if side == "SELL" and pnl >= max_profit * self.profit_target:
-                exits.append(self._create_exit(pos, "PROFIT_TARGET", pnl))
+            if dte <= self.force_exit_dte:
+                exits.append(self._create_exit(
+                    pos,
+                    "FORCE_EXIT_T-1",
+                    pnl
+                ))
                 continue
 
             # --------------------------------------------------
-            # 2️⃣ STOP LOSS (ALL POSITIONS)
+            # RULE 2: PROFIT TARGET
             # --------------------------------------------------
-            if side == "SELL" and pnl <= -(max_profit * self.stop_loss):
-                exits.append(self._create_exit(pos, "STOP_LOSS", pnl))
+            if pos["side"] == "SELL" and pnl >= (entry_premium * self.profit_target):
+                exits.append(self._create_exit(
+                    pos,
+                    "PROFIT_TARGET",
+                    pnl
+                ))
                 continue
 
             # --------------------------------------------------
-            # 3️⃣ GAMMA / EXPIRY RISK
+            # RULE 3: STOP LOSS
             # --------------------------------------------------
-            if self._days_to_expiry(pos.get("expiry")) <= self.min_dte:
-                exits.append(self._create_exit(pos, "EXPIRY_RISK", pnl))
+            if pnl <= -(entry_premium * self.stop_loss):
+                exits.append(self._create_exit(
+                    pos,
+                    "STOP_LOSS",
+                    pnl
+                ))
                 continue
 
             # --------------------------------------------------
-            # 4️⃣ EMERGENCY VOL SPIKE EXIT (OPTIONAL HOOK)
+            # RULE 4: GAMMA RISK (EARLY EXIT)
             # --------------------------------------------------
-            if snapshot.get("vix", 0) > 30 and side == "SELL":
-                exits.append(self._create_exit(pos, "VOLATILITY_SPIKE", pnl))
+            if dte <= self.min_dte:
+                exits.append(self._create_exit(
+                    pos,
+                    "GAMMA_RISK_EXIT",
+                    pnl
+                ))
+                continue
 
         return exits
 
-    # --------------------------------------------------
-    # EXIT ORDER CREATION
-    # --------------------------------------------------
     def _create_exit(self, pos: Dict, reason: str, pnl: float) -> Dict:
         return {
-            "action": "EXIT",
+            "action": "CLOSE_POSITION",
             "instrument_key": pos["instrument_key"],
             "quantity": abs(pos["quantity"]),
             "side": "BUY" if pos["side"] == "SELL" else "SELL",
             "strategy": "EXIT",
-            "reason": f"{reason} | PnL={pnl:.2f}",
+            "reason": f"{reason} | PnL/lot={pnl:.2f}"
         }
 
-    # --------------------------------------------------
-    # DTE CALCULATION
-    # --------------------------------------------------
     def _days_to_expiry(self, expiry) -> int:
-        if not expiry:
-            return 999
-
         try:
             if isinstance(expiry, str):
                 for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y"):
                     try:
-                        expiry_dt = datetime.strptime(expiry, fmt)
+                        expiry = datetime.strptime(expiry, fmt)
                         break
                     except ValueError:
                         continue
-                else:
-                    return 999
-            else:
-                expiry_dt = expiry
 
-            return max((expiry_dt - datetime.now()).days, 0)
+            if isinstance(expiry, datetime):
+                return (expiry.date() - datetime.now().date()).days
         except Exception:
-            return 999
+            pass
+
+        return 999
