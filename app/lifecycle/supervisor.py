@@ -13,7 +13,7 @@ from app.core.data.quality_gate import DataQualityGate
 from app.database import add_decision_log
 from app.services.alert_service import alert_service
 from app.services.telegram_alerts import telegram_alerts
-from app.lifecycle.safety_controller import SafetyController, ExecutionMode
+from app.lifecycle.safety_controller import SafetyController, ExecutionMode, SystemState
 from app.core.risk.capital_governor import CapitalGovernor
 from app.services.approval_system import ManualApprovalSystem
 
@@ -39,7 +39,7 @@ from app.utils.metrics import (
     record_order_placed, record_order_failed, record_safety_violation,
     orders_placed_total as orders_placed, orders_failed_total as orders_failed,
     risk_limit_breaches as safety_violations,
-    track_duration  # Added missing import
+    track_duration
 )
 
 logger = logging.getLogger(__name__)
@@ -200,7 +200,6 @@ class ProductionTradingSupervisor:
                 # ============================================
                 # ACTUAL METRICS: Track cycle duration
                 # ============================================
-                # Note: Removed .time() context manager as supervisor_cycle_duration is a Histogram, not a Timer
                 start_time = time.time()
                 
                 # PHASE 1: SMART DATA REFRESH
@@ -228,8 +227,12 @@ class ProductionTradingSupervisor:
                         logger.critical(f"[{cycle_id}] DATA CIRCUIT BREAKER TRIPPED!")
                         await self.safety.record_failure("DATA_CIRCUIT_BREAKER", 
                             {"failures": self.consecutive_data_failures}, "CRITICAL")
-                        self.safety.system_state = self.safety.system_state.HALTED
+                        self.safety.system_state = SystemState.HALTED  # FIXED: Use SystemState enum
                         set_system_state("HALTED")
+                        
+                        # Stop the loop when halted
+                        self.running = False
+                        break
 
                     # Skip this cycle
                     cycle_duration_actual = time.monotonic() - cycle_start_mono
@@ -323,8 +326,8 @@ class ProductionTradingSupervisor:
                             record_order_placed(
                                 adj.get("side", "UNKNOWN"),
                                 adj.get("strategy", "UNKNOWN"),
-                                "OPTION",  # instrument_type
-                                "MARKET",  # order_type
+                                "OPTION",
+                                "MARKET",
                                 "PLACED"
                             )
                         elif result.get("status") == "FAILED":
