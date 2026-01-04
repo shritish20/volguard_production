@@ -60,7 +60,7 @@ jobs:
           cache: 'pip'
 
       - name: Cache Python dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/pip
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload Test Artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # UPDATED FROM v3 to v4
         with:
           name: chaos-test-artifacts
           path: |
