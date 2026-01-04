@@ -1,17 +1,25 @@
+# app/api/v1/endpoints/dashboard.py
+
 from fastapi import APIRouter, HTTPException, Depends
 from datetime import datetime
-from app.config import settings
+import asyncio
+import logging
+
+from app.dependencies import get_market_client, get_persistence_service
 from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
+from app.services.persistence import PersistenceService
+
+# Core Analytics Engines
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.structure import StructureEngine
 from app.core.analytics.edge import EdgeEngine
 from app.core.analytics.regime import RegimeEngine
+
+# Schemas
 from app.schemas.analytics import (
     FullAnalysisResponse, VolatilityDashboard, EdgeDashboard, 
     StructureDashboard, ScoresDashboard, CapitalDashboard, MetricItem, ExtMetrics
 )
-import asyncio
-import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -38,16 +46,14 @@ def mk_item(val, type_tag=None, suffix=""):
     return MetricItem(value=val, formatted=v_str, tag=tag, color=color)
 
 @router.post("/analyze", response_model=FullAnalysisResponse)
-async def analyze_market_state():
+async def analyze_market_state(
+    market: MarketDataClient = Depends(get_market_client),
+    db: PersistenceService = Depends(get_persistence_service)
+):
     """
-    On-demand full market analysis.
-    Returns the exact state of the 'Brain' including Scoring Weights.
+    On-demand full market analysis using the VolGuard 3.0 Hybrid Engine.
+    Uses Postgres for History (Tier 1) and API for Live (Tier 3).
     """
-    client = MarketDataClient(
-        settings.UPSTOX_ACCESS_TOKEN,
-        settings.UPSTOX_BASE_V2,
-        settings.UPSTOX_BASE_V3
-    )
     
     # Initialize Engines
     vol_engine = VolatilityEngine()
@@ -56,46 +62,79 @@ async def analyze_market_state():
     regime_engine = RegimeEngine()
 
     try:
-        # 1. Parallel Data Fetching
-        task_nh = client.get_history(NIFTY_KEY)
-        task_vh = client.get_history(VIX_KEY)
-        task_live = client.get_live_quote([NIFTY_KEY, VIX_KEY])
-        task_exp = client.get_expiries_and_lot()
+        # 1. PARALLEL DATA FETCH (Smart Hybrid)
+        # We try to load history from DB first (fast), then refresh intraday
+        
+        # A. History (Tier 1 - Postgres)
+        nh_task = db.load_daily_history(NIFTY_KEY, days=365)
+        vh_task = db.load_daily_history(VIX_KEY, days=365)
+        
+        # B. Intraday & Live (Tier 2 & 3 - API)
+        intra_task = market.get_intraday_candles(NIFTY_KEY)
+        live_task = market.get_live_quote([NIFTY_KEY, VIX_KEY])
+        exp_task = market.get_expiries() # Returns tuple (weekly, monthly)
 
-        nh, vh, live_data, (we, me, lot) = await asyncio.gather(
-            task_nh, task_vh, task_live, task_exp
+        # Execute Gather
+        nh, vh, intra, live_data, (we, me) = await asyncio.gather(
+            nh_task, vh_task, intra_task, live_task, exp_task
         )
 
+        # Fallback: If DB is empty, fetch from API directly (Cold Start)
+        if nh.empty:
+            nh = await market.get_daily_candles(NIFTY_KEY)
+        if vh.empty:
+            vh = await market.get_daily_candles(VIX_KEY)
+
         if nh.empty or not we:
-            raise HTTPException(status_code=500, detail="Data Fetch Failed")
+            raise HTTPException(status_code=500, detail="Data Fetch Failed (History or Expiry missing)")
 
-        # Fetch Chains
-        wc, mc = await asyncio.gather(client.get_option_chain(we), client.get_option_chain(me))
+        # C. Fetch Option Chains (Tier 2)
+        # We need chains for both Weekly and Monthly for Edge detection
+        chain_tasks = [market.get_option_chain(we)]
+        if me:
+            chain_tasks.append(market.get_option_chain(me))
+        
+        chains = await asyncio.gather(*chain_tasks)
+        wc = chains[0]
+        mc = chains[1] if len(chains) > 1 else None
 
-        # 2. Logic Calculation (The Brain)
+        # 2. LOGIC CALCULATION (The Brain)
         spot_val = live_data.get(NIFTY_KEY, 0)
         vix_val = live_data.get(VIX_KEY, 0)
 
-        # A. Volatility
-        vol = await vol_engine.calculate_volatility(nh, vh, spot_val, vix_val)
+        # A. Volatility (Hybrid Calculation)
+        # This merges Daily (DB) + Intraday (API) for real-time Parkinson Vol
+        vol = await vol_engine.calculate_volatility(nh, intra, spot_val, vix_val)
         
         # B. Structure
-        st = struct_engine.analyze_structure(wc, vol.spot, lot)
+        # Get dynamic lot size
+        contract_details = await market.get_contract_details("NIFTY")
+        lot_size = contract_details.get("lot_size", 50)
+        
+        st = struct_engine.analyze_structure(wc, vol.spot, lot_size)
         
         # C. Edge
         ed = edge_engine.detect_edges(wc, mc, vol.spot, vol)
 
-        # D. External (Mock for now, replace with real news feed later)
-        fast = False
-        if len(nh) > 0:
-            l = nh.iloc[-1]
-            fast = ((l['high']-l['low'])/l['open']*100) > 1.5
-        ext = ExtMetrics(1500, 500, 1, ["RBI Policy"], fast)
+        # D. External (Placeholder / Simple Technicals)
+        # In V3, we calculate 'Fast Vol' from Intraday data if available
+        fast_vol = False
+        if not intra.empty:
+            # Check last 15 mins for rapid moves
+            recent = intra.tail(15)
+            if not recent.empty:
+                high = recent['high'].max()
+                low = recent['low'].min()
+                open_ = recent.iloc[0]['open']
+                if open_ > 0 and ((high - low) / open_ * 100) > 1.5:
+                    fast_vol = True
+
+        ext = ExtMetrics(fii=0, dii=0, events=0, event_names=[], fast_vol=fast_vol)
 
         # E. Regime (The Decision)
         reg = regime_engine.calculate_regime(vol, st, ed, ext)
 
-        # 3. Response Construction (Exposing the Data)
+        # 3. Response Construction
         return FullAnalysisResponse(
             timestamp=datetime.now(),
             
@@ -106,22 +145,22 @@ async def analyze_market_state():
                 ivp_30=mk_item(vol.ivp30, "IVP", "%"),
                 ivp_90=mk_item(vol.ivp90, "IVP", "%"),
                 ivp_1y=mk_item(vol.ivp1y, "IVP", "%"),
-                rv_7_28=mk_item(vol.rv7), # Simplified for dashboard
-                garch_7_28=mk_item(vol.ga7),
+                rv_7_28=mk_item(vol.rv7),
+                garch_7_28=mk_item(vol.garch7), # Corrected field name from engine
                 parkinson_7_28=mk_item(vol.pk7),
                 is_fallback=vol.is_fallback
             ),
             
             edges=EdgeDashboard(
-                iv_weekly=mk_item(ed.iv_w, suffix="%"),
-                iv_monthly=mk_item(ed.iv_m, suffix="%"),
+                iv_weekly=mk_item(ed.iv_weekly, suffix="%"), # Corrected field name from engine
+                iv_monthly=mk_item(ed.iv_monthly, suffix="%"),
                 vrp_rv_w=mk_item(ed.vrp_rv_w, "VRP"),
                 vrp_rv_m=mk_item(ed.vrp_rv_m, "VRP"),
-                vrp_ga_w=mk_item(ed.vrp_ga_w, "VRP"),
-                vrp_ga_m=mk_item(ed.vrp_ga_m, "VRP"),
+                vrp_ga_w=mk_item(ed.vrp_garch_w, "VRP"), # Corrected field name
+                vrp_ga_m=mk_item(ed.vrp_garch_m, "VRP"),
                 vrp_pk_w=mk_item(ed.vrp_pk_w, "VRP"),
                 vrp_pk_m=mk_item(ed.vrp_pk_m, "VRP"),
-                term_structure=mk_item(ed.term, "TERM")
+                term_structure=mk_item(ed.term_structure, "TERM")
             ),
             
             structure=StructureDashboard(
@@ -131,13 +170,12 @@ async def analyze_market_state():
                 skew_25d=mk_item(st.skew, "SKEW", "%")
             ),
             
-            # CRITICAL: This exposes the "Why" (Weights & Scores)
             scores=ScoresDashboard(
-                vol_score=reg.v_scr,      # The 40% component
-                struct_score=reg.s_scr,   # The 30% component
-                edge_score=reg.e_scr,     # The 20% component
-                risk_score=reg.r_scr,     # The 10% component
-                total_score=reg.score     # The Final Decision (e.g. 7.2)
+                vol_score=reg.v_scr,
+                struct_score=reg.s_scr,
+                edge_score=reg.e_scr,
+                risk_score=reg.r_scr,
+                total_score=reg.score
             ),
             
             external={
@@ -148,17 +186,15 @@ async def analyze_market_state():
             },
             
             capital=CapitalDashboard(
-                regime_name=reg.name,       # e.g. "AGGRESSIVE_SHORT"
-                primary_edge=reg.primary,   # e.g. "SHORT_GAMMA"
+                regime_name=reg.name,
+                primary_edge=reg.primary_edge,
                 allocation_pct=reg.alloc_pct,
                 max_lots=reg.max_lots,
-                recommendation=f"Allocate {reg.alloc_pct}% Capital ({reg.max_lots} lots)"
+                recommendation=f"Allocate {reg.alloc_pct*100:.0f}% Capital ({reg.max_lots} lots)"
             )
         )
 
     except Exception as e:
         logger.error(f"Analysis failed: {str(e)}")
+        # Don't expose raw stack traces in production, but for debugging it's useful
         raise HTTPException(status_code=500, detail=f"Analysis Error: {str(e)}")
-        
-    finally:
-        await client.close()
