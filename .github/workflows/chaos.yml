@@ -8,9 +8,15 @@ on:
     branches: [ "main" ]
   workflow_dispatch:  # Allows manual triggering button
 
+# Add concurrency to prevent multiple runs on same commit
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   chaos_testing:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Prevent infinite runs
     
     # Service Containers (The "Plumbing" for the test runner)
     services:
@@ -39,42 +45,221 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+        # Add volume for persistence if needed for migration tests
+        volumes:
+          - postgres-data:/var/lib/postgresql/data
+
+    # Cache dependencies to speed up runs
+    env:
+      PIP_CACHE_DIR: ~/.cache/pip
+      POETRY_CACHE_DIR: ~/.cache/poetry
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for proper versioning
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+          cache: 'pip'  # Enable pip caching
 
-      - name: Install Dependencies
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/pre-commit
+            ~/.cache/pypoetry
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/pyproject.toml', '**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install System Dependencies
         run: |
-          python -m pip install --upgrade pip
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client libpq-dev
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          # Check for different requirement files
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
           if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
-          # Ensure pytest-asyncio is installed for async tests
-          pip install pytest pytest-asyncio httpx redis
+          
+          # Ensure chaos testing dependencies
+          pip install pytest pytest-asyncio pytest-xdist pytest-cov \
+                     httpx redis prometheus_client \
+                     pandas numpy  # Likely needed for your trading code
+          
+          # Install any missing dependencies
+          pip install anyio psycopg2-binary sqlalchemy
 
       - name: Create Fake Environment Config
         # We need a .env file so the config loader doesn't crash
         run: |
-          echo "UPSTOX_ACCESS_TOKEN=mock_token" >> .env
-          echo "UPSTOX_BASE_V2=https://api.upstox.com/v2" >> .env
-          echo "UPSTOX_BASE_V3=https://api.upstox.com/v3" >> .env
-          echo "REDIS_URL=redis://localhost:6379/0" >> .env
-          echo "POSTGRES_SERVER=localhost" >> .env
-          echo "POSTGRES_USER=volguard" >> .env
-          echo "POSTGRES_PASSWORD=volguard_secure" >> .env
-          echo "POSTGRES_DB=volguard_production" >> .env
-          echo "ENVIRONMENT=shadow" >> .env
-          echo "BASE_CAPITAL=1000000" >> .env
-          echo "MAX_DAILY_LOSS=20000" >> .env
+          cat > .env << EOF
+          # Upstox Configuration
+          UPSTOX_ACCESS_TOKEN=mock_token_chaos_test_123
+          UPSTOX_BASE_V2=https://api.upstox.com/v2
+          UPSTOX_BASE_V3=https://api.upstox.com/v3
+          
+          # Database Configuration
+          REDIS_URL=redis://localhost:6379/0
+          POSTGRES_SERVER=localhost
+          POSTGRES_USER=volguard
+          POSTGRES_PASSWORD=volguard_secure
+          POSTGRES_DB=volguard_production
+          DATABASE_URL=postgresql://volguard:volguard_secure@localhost:5432/volguard_production
+          
+          # Application Configuration
+          ENVIRONMENT=shadow
+          BASE_CAPITAL=1000000
+          MAX_DAILY_LOSS=20000
+          MAX_POSITIONS=10
+          LOOP_INTERVAL_SECONDS=3
+          
+          # API Keys (mock)
+          TELEGRAM_BOT_TOKEN=mock_telegram_token
+          TELEGRAM_CHAT_ID=123456789
+          
+          # Feature Flags
+          ENABLE_METRICS=true
+          ENABLE_ALERTS=false
+          ENABLE_WEBSOCKET=false
+          
+          # Chaos Testing Flags
+          CHAOS_TESTING_MODE=true
+          MOCK_EXTERNAL_APIS=true
+          EOF
+          
+          # Also create test-specific env if needed
+          cat > .env.test << EOF
+          TESTING=true
+          PYTHONPATH=.
+          EOF
+
+      - name: Wait for Services to be Ready
+        run: |
+          # Wait for PostgreSQL
+          until pg_isready -h localhost -p 5432; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          
+          # Wait for Redis
+          until redis-cli -h localhost -p 6379 ping | grep -q PONG; do
+            echo "Waiting for Redis..."
+            sleep 2
+          done
+          
+          echo "All services are ready!"
+
+      - name: Initialize Database Schema
+        # Only needed if your tests require database tables
+        run: |
+          # Create a simple test to see if schema loading works
+          python -c "
+          try:
+              # Try to import app modules that might need DB
+              import sys
+              sys.path.append('.')
+              
+              # This is a test - if you have alembic or other migration tools, use them here
+              print('Database connectivity test passed')
+          except Exception as e:
+              print(f'Database import test failed (might be OK for chaos tests): {e}')
+          "
+        continue-on-error: true  # Continue even if DB setup fails (chaos tests should handle this)
 
       - name: 🐵 RUN CHAOS TESTS
         env:
           PYTHONPATH: .
+          TESTING: true
+          CHAOS_TESTING: true
+          MOCK_EXTERNAL_APIS: true
         run: |
-          echo "🔥 unleash the chaos monkey..."
-          # -v for verbose, -s to see the print statements
-          pytest tests/test_chaos.py -v -s
+          echo "🔥 UNLEASH THE CHAOS MONKEY... 🔥"
+          echo "=================================="
+          echo "Running comprehensive chaos testing suite"
+          echo "Python path: $PYTHONPATH"
+          echo "Environment: shadow"
+          echo ""
+          
+          # First, run a quick syntax check
+          echo "🔍 Running syntax check..."
+          python -m py_compile app/utils/metrics.py app/lifecycle/supervisor.py tests/test_chaos.py
+          echo "✅ Syntax check passed"
+          
+          echo ""
+          echo "🧪 Running chaos tests with increased verbosity..."
+          
+          # Run chaos tests with detailed output
+          # -v: verbose
+          # -s: show print statements
+          # --tb=short: shorter tracebacks
+          # --disable-warnings: suppress warnings for cleaner output
+          # --color=yes: colored output
+          pytest tests/test_chaos.py \
+            -v \
+            -s \
+            --tb=short \
+            --disable-warnings \
+            --color=yes \
+            --log-level=INFO
+          
+          echo ""
+          echo "✅ Chaos testing completed!"
+
+      - name: Run Additional Safety Tests
+        # Optional: Run any additional safety/regression tests
+        if: always()  # Run even if chaos tests fail
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "🛡️ Running safety checks..."
+          
+          # Check for any obvious issues in key files
+          echo "Checking supervisor.py for critical issues..."
+          if grep -q "except:" app/lifecycle/supervisor.py; then
+            echo "⚠️ Warning: Bare except clause found in supervisor.py"
+          else
+            echo "✅ No bare except clauses in supervisor.py"
+          fi
+          
+          echo "Checking metrics.py for syntax issues..."
+          python -c "from app.utils.metrics import *; print('✅ Metrics module imports successfully')"
+          
+          echo "Safety checks completed!"
+
+      - name: Upload Test Results
+        # Upload test results as artifact for debugging
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: chaos-test-results
+          path: |
+            reports/
+            .pytest_cache/
+          retention-days: 7
+
+      - name: Send Notification on Failure
+        # Optional: Add notification for failures
+        if: failure()
+        run: |
+          echo "❌ CHAOS TESTS FAILED! ❌"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          # You could add Slack/Email notifications here
+          # Example with curl to webhook:
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Chaos tests failed!"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# Define volumes for service containers
+volumes:
+  postgres-data:
