@@ -4,10 +4,11 @@ import logging
 import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Float, DateTime, Integer, JSON, Boolean, Text, BigInteger, Index
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import settings
+from app.models.base import Base  # <--- FIXED: Import Base from shared module
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ AsyncSessionLocal = sessionmaker(
     expire_on_commit=False
 )
 
-Base = declarative_base()
+# Base declaration removed here to avoid circular imports.
+# It is now imported from app.models.base
 
 # ==== TRADE RECORDS ====
 class TradeRecord(Base):
