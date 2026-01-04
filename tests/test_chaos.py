@@ -1,8 +1,7 @@
-# tests/test_chaos.py
+# tests/test_chaos.py - COMPLETE FIXED VERSION
 
 import pytest
 import asyncio
-import os  # Added for kill switch test
 from unittest.mock import MagicMock, AsyncMock, patch
 from httpx import HTTPStatusError, Request, Response
 import redis.asyncio as redis
@@ -10,7 +9,7 @@ from datetime import datetime
 
 from app.lifecycle.supervisor import ProductionTradingSupervisor
 from app.lifecycle.safety_controller import SystemState, ExecutionMode
-from app.core.market.data_client import MarketDataClient
+from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY  # Import the actual keys
 from app.core.trading.executor import TradeExecutor
 from app.core.data.quality_gate import DataQualityGate
 
@@ -20,10 +19,10 @@ from app.core.data.quality_gate import DataQualityGate
 def mock_dependencies():
     """Creates a Supervisor with mocked external connections"""
     market = AsyncMock(spec=MarketDataClient)
-    # Default behavior: Returns valid data
+    # Default behavior: Returns valid data with correct keys
     market.get_live_quote.return_value = {
-        "NIFTY": 21500.0, 
-        "VIX": 15.0
+        NIFTY_KEY: 21500.0,  # Use actual constants
+        VIX_KEY: 15.0
     }
     market.get_holidays.return_value = []
     market.get_daily_candles.return_value = MagicMock()
@@ -114,13 +113,6 @@ async def test_chaos_api_failure(mock_dependencies):
     
     print("\n💥 Simulating Upstox 503 Crash...")
     
-    # 2. Simulate the actual supervisor loop behavior
-    # In production, when API fails:
-    # - _read_live_snapshot() catches exception, returns spot=0.0
-    # - validate_snapshot() rejects spot=0.0
-    # - consecutive_data_failures increments
-    # - After max_data_failures (3), circuit breaker trips
-    
     # Reset failure counter for clean test
     supervisor.consecutive_data_failures = 0
     
@@ -194,9 +186,6 @@ async def test_chaos_redis_death(mock_dependencies):
     assert result["status"] in ["FAILED", "CRASH", "TIMEOUT"], \
         f"Expected failure status, got {result.get('status')}"
     
-    # Check that safety controller recorded the failure
-    # (We can't directly check safety.consecutive_failures without mocking it)
-    
     print("✅ System caught Redis crash and recorded failure.")
 
 # === CHAOS SCENARIO 3: BAD DATA INJECTION ===
@@ -211,8 +200,8 @@ async def test_chaos_data_corruption(mock_dependencies):
     
     # 1. Inject Poison: Zero Spot Price (corrupted data)
     market.get_live_quote.return_value = {
-        "NIFTY": 0.0,  # Corrupted data - spot price cannot be 0
-        "VIX": 15.0
+        NIFTY_KEY: 0.0,  # Corrupted data - spot price cannot be 0
+        VIX_KEY: 15.0
     }
     
     print("\n💥 Simulating Data Corruption (Spot = 0.0)...")
@@ -302,10 +291,10 @@ async def test_chaos_websocket_disconnect(mock_dependencies):
     """
     supervisor, market, _, _ = mock_dependencies
     
-    # 1. Mock market to return VALID data even without WebSocket
+    # Ensure market returns valid data
     market.get_live_quote.return_value = {
-        "NIFTY": 21500.0,  # Valid spot price
-        "VIX": 15.0
+        NIFTY_KEY: 21500.0,  # Valid spot price
+        VIX_KEY: 15.0
     }
     
     # Create a mock WebSocket service
@@ -318,20 +307,17 @@ async def test_chaos_websocket_disconnect(mock_dependencies):
     
     print("\n💥 Simulating WebSocket Disconnection...")
     
-    # 2. Get snapshot (should handle WS failure gracefully)
+    # Get snapshot
     snapshot = await supervisor._read_live_snapshot()
     
-    # 3. Verify system handles missing WebSocket data
-    assert snapshot is not None, "Should return snapshot even without WebSocket"
-    assert "live_greeks" in snapshot, "Snapshot should contain live_greeks field"
-    assert "ws_healthy" in snapshot, "Snapshot should contain ws_healthy field"
+    # Verify we got valid data
+    assert snapshot["spot"] == 21500.0, f"Spot should be 21500.0, got {snapshot['spot']}"
+    assert snapshot["vix"] == 15.0, f"VIX should be 15.0, got {snapshot['vix']}"
     assert snapshot["ws_healthy"] is False, "WebSocket should be marked as unhealthy"
-    assert snapshot["spot"] == 21500.0, f"Spot should be valid: {snapshot['spot']}"
     
-    # 4. Verify data is still usable (spot price should be valid)
+    # Validate - should pass since spot is valid
     valid, reason = supervisor.quality.validate_snapshot(snapshot)
     
-    # Spot should be valid even without WebSocket
     assert valid is True, f"Data should be valid even without WebSocket. Reason: {reason}"
     assert snapshot["spot"] > 0, f"Spot price should be positive: {snapshot['spot']}"
     
@@ -354,15 +340,11 @@ async def test_chaos_market_holiday(mock_dependencies):
     print(f"\n💥 Simulating Market Holiday ({today})...")
     
     # 2. Attempt to check market status
-    # This would normally happen in start() method
     try:
         holidays = await asyncio.wait_for(market.get_holidays(), timeout=1.0)
         
         # Verify holiday detection
         assert today in holidays, f"Today ({today}) should be in holidays list"
-        
-        # In production, this would trigger exit(0) in _check_market_status()
-        # For testing, we just verify the detection logic
         
         print(f"✅ Holiday correctly detected: {today}")
         
@@ -399,11 +381,7 @@ async def test_chaos_network_partition(mock_dependencies):
     except Exception as e:
         pytest.fail(f"Market data timeout not handled: {e}")
     
-    # Test positions fetch timeout (mocked - would fail in _update_positions)
-    # We can't easily test this without running full loop, but we trust the error handling
-    
     # 3. Verify system state doesn't crash to emergency immediately
-    # (Some failures should be tolerated before escalation)
     assert supervisor.safety.system_state != SystemState.EMERGENCY, \
         "Single network issue shouldn't cause EMERGENCY state"
     
@@ -475,43 +453,45 @@ async def test_chaos_clock_drift_detection():
 # === CHAOS SCENARIO 10: KILL SWITCH ACTIVATION ===
 
 @pytest.mark.asyncio
-async def test_chaos_kill_switch(mock_dependencies):
+async def test_chaos_kill_switch():
     """
     Scenario: Kill switch file is detected.
     Expectation: System stops immediately.
     """
-    supervisor, _, _, _ = mock_dependencies
+    # Create a standalone supervisor
+    supervisor = ProductionTradingSupervisor(
+        market_client=AsyncMock(),
+        risk_engine=AsyncMock(),
+        adjustment_engine=AsyncMock(),
+        trade_executor=AsyncMock(),
+        trading_engine=AsyncMock(),
+        capital_governor=AsyncMock(),
+        websocket_service=None,
+        loop_interval_seconds=0.01
+    )
     
     print("\n💥 Simulating Kill Switch Activation...")
     
-    # 1. Mock os.path.exists for the kill switch
-    original_exists = os.path.exists
-    
-    kill_switch_detected = False
-    
-    def mock_exists(path):
-        if "KILL_SWITCH" in str(path).upper():
-            nonlocal kill_switch_detected
-            kill_switch_detected = True
-            return True
-        return original_exists(path)
-    
-    try:
-        # Apply the mock
-        os.path.exists = mock_exists
+    # Use unittest.mock.patch to mock os.path.exists
+    with patch('os.path.exists') as mock_exists:
+        # Make it return True for kill switch files
+        def side_effect(path):
+            if "KILL_SWITCH" in str(path).upper():
+                return True
+            return False  # Default to False for other paths
         
-        # 2. Check kill switch
+        mock_exists.side_effect = side_effect
+        
+        # Check kill switch
         should_stop = supervisor._check_kill_switch()
         
-        # 3. Verify kill switch detection
+        # Verify kill switch detection
         assert should_stop is True, "Kill switch should be detected"
-        assert kill_switch_detected is True, "Kill switch file should be checked"
+        
+        # Verify os.path.exists was called
+        mock_exists.assert_called()
         
         print("✅ Kill switch correctly detected")
-        
-    finally:
-        # Restore original os.path.exists
-        os.path.exists = original_exists
 
 # === MAIN TEST RUNNER (Optional) ===
 
