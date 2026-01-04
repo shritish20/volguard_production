@@ -3,10 +3,12 @@
 import uuid
 import logging
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, Optional
 from sqlalchemy import Column, String, DateTime, JSON
 from sqlalchemy.future import select
+
 from app.database import Base, AsyncSessionLocal
+from app.services.telegram_alerts import telegram_alerts
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,9 @@ logger = logging.getLogger(__name__)
 # DATABASE MODEL
 # --------------------------------------------------
 class ApprovalRequest(Base):
+    """
+    Stores pending trade requests for Semi-Auto mode.
+    """
     __tablename__ = "approval_requests"
 
     id = Column(String, primary_key=True)
@@ -23,7 +28,7 @@ class ApprovalRequest(Base):
     adjustment = Column(JSON)
     market_snapshot = Column(JSON)
 
-    # PENDING → APPROVED / REJECTED / EXPIRED → CONSUMED
+    # Status: PENDING → APPROVED / REJECTED / EXPIRED → CONSUMED
     status = Column(String, default="PENDING")
     decision_time = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=True)
@@ -35,7 +40,10 @@ class ApprovalRequest(Base):
 class ManualApprovalSystem:
     """
     Manages SEMI_AUTO trade approvals.
-    Guarantees one-time consumption.
+    Features:
+    1. Time-limited requests (Auto-expire).
+    2. Atomic Consumption (Prevents double execution).
+    3. Telegram Notifications (Real-time alerts).
     """
 
     def __init__(self):
@@ -45,9 +53,13 @@ class ManualApprovalSystem:
     # REQUEST
     # ---------------------------
     async def request_approval(self, adjustment: Dict, market: Dict) -> str:
+        """
+        Creates a pending request and notifies admin via Telegram.
+        """
         req_id = str(uuid.uuid4())
         expires = datetime.utcnow() + timedelta(minutes=self.approval_timeout_minutes)
 
+        # 1. Persist to DB
         async with AsyncSessionLocal() as session:
             req = ApprovalRequest(
                 id=req_id,
@@ -60,7 +72,29 @@ class ManualApprovalSystem:
             session.add(req)
             await session.commit()
 
-        logger.info(f"APPROVAL REQUESTED [{req_id}] {adjustment.get('strategy')}")
+        # 2. Log & Alert
+        strategy = adjustment.get("strategy", "UNKNOWN")
+        action = adjustment.get("action", "TRADE")
+        symbol = adjustment.get("instrument_key", "UNKNOWN")
+        qty = adjustment.get("quantity", 0)
+        
+        logger.info(f"APPROVAL REQUESTED [{req_id}] {strategy}")
+        
+        # SMART FEATURE: Send Telegram Ping
+        msg = (
+            f"Strategy: *{strategy}*\n"
+            f"Action: `{action}` {qty} x {symbol}\n"
+            f"Expires in: {self.approval_timeout_minutes} mins\n"
+            f"ID: `{req_id}`"
+        )
+        
+        await telegram_alerts.send_alert(
+            title="⚠️ APPROVAL REQUIRED",
+            message=msg,
+            severity="WARNING",
+            data={"req_id": req_id}
+        )
+        
         return req_id
 
     # ---------------------------
@@ -72,6 +106,7 @@ class ManualApprovalSystem:
             if not req:
                 return "UNKNOWN"
 
+            # Auto-Expire Check
             if req.status == "PENDING" and datetime.utcnow() > req.expires_at:
                 req.status = "EXPIRED"
                 await session.commit()
@@ -85,7 +120,7 @@ class ManualApprovalSystem:
     async def consume_if_approved(self, req_id: str) -> Dict:
         """
         Atomically checks and consumes an approval.
-        Returns adjustment if approved, else {}.
+        Returns adjustment dict if approved, else empty dict.
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -102,10 +137,11 @@ class ManualApprovalSystem:
                 await session.commit()
                 return {}
 
+            # Only consume if APPROVED
             if req.status != "APPROVED":
                 return {}
 
-            # Consume exactly once
+            # Atomic Consumption
             req.status = "CONSUMED"
             req.consumed_at = datetime.utcnow()
             await session.commit()
@@ -122,6 +158,12 @@ class ManualApprovalSystem:
                 req.status = "APPROVED"
                 req.decision_time = datetime.utcnow()
                 await session.commit()
+                
+                await telegram_alerts.send_alert(
+                    title="✅ REQUEST APPROVED",
+                    message=f"Request {req_id[:8]} authorized for execution.",
+                    severity="SUCCESS"
+                )
                 return True
         return False
 
@@ -132,5 +174,11 @@ class ManualApprovalSystem:
                 req.status = "REJECTED"
                 req.decision_time = datetime.utcnow()
                 await session.commit()
+                
+                await telegram_alerts.send_alert(
+                    title="🚫 REQUEST REJECTED",
+                    message=f"Request {req_id[:8]} was rejected.",
+                    severity="INFO"
+                )
                 return True
         return False
