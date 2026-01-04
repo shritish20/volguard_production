@@ -1,135 +1,118 @@
+# app/core/trading/exit_engine.py
+
 import logging
+import asyncio
+from datetime import datetime
 from typing import List, Dict
-from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-
 class ExitEngine:
     """
-    Seller-first exit engine.
-    NO firefighting.
-    NO last-day risk.
+    VolGuard Smart Exit Engine (VolGuard 3.0)
+    
+    Responsibilities:
+    1. PROFIT TAKER: Exits winners early to free capital (Target: 70% of Max Profit).
+    2. STOP LOSS: Hard exit if a single leg bleeds too much (Target: 200% of Credit).
+    3. TIME EXIT: Auto-closes near expiry (0 DTE) to avoid gamma explosions.
     """
 
-    def __init__(
-        self,
-        profit_target_pct: float = 0.70,
-        stop_loss_multiple: float = 2.0,
-        hard_expiry_days: int = 1
-    ):
-        """
-        :param profit_target_pct: % of premium captured (seller logic)
-        :param stop_loss_multiple: multiple of credit where we exit (2x default)
-        :param hard_expiry_days: force exit N days before expiry (T-1 default)
-        """
-        self.profit_target = profit_target_pct
-        self.stop_loss_multiple = stop_loss_multiple
-        self.hard_expiry_days = hard_expiry_days
+    def __init__(self):
+        # Configurable Thresholds
+        self.take_profit_pct = 0.70  # Capture 70% of max potential
+        self.stop_loss_pct = 2.00    # Stop at 200% loss (3x price)
+        self.time_exit_hour = 14     # 2:00 PM
+        self.time_exit_minute = 30   # 2:30 PM
 
     async def evaluate_exits(
-        self,
-        positions: List[Dict],
+        self, 
+        positions: List[Dict], 
         snapshot: Dict
     ) -> List[Dict]:
+        """
+        Scans all open positions for exit signals.
+        Returns a list of EXIT orders.
+        """
         exits = []
-
+        
         for pos in positions:
-            # Skip invalid positions
-            if not pos.get("quantity") or "average_price" not in pos:
+            # Skip if already closing or invalid
+            if pos.get("quantity", 0) == 0:
                 continue
 
-            qty = abs(int(pos["quantity"]))
-            if qty == 0:
-                continue
+            reason = None
+            
+            # Data Normalization
+            qty = abs(pos["quantity"])
+            entry_price = float(pos.get("average_price", 0.0))
+            current_price = float(pos.get("current_price", 0.0))
+            pnl = float(pos.get("pnl", 0.0))
+            side = pos.get("side") # BUY or SELL
+            
+            # 1. TIME EXIT (0 DTE Safety)
+            # Avoid getting stuck in Gamma traps or delivery settlement
+            if self._is_expiry_danger_zone(pos.get("expiry")):
+                reason = "0 DTE Safety Exit"
+            
+            # 2. SELLER LOGIC (Short Options)
+            elif side == "SELL":
+                # Max Profit = Entry Price (since we sold it)
+                # Current Profit = Entry - Current
+                # Take Profit Check
+                if entry_price > 0:
+                    profit_pct = (entry_price - current_price) / entry_price
+                    if profit_pct >= self.take_profit_pct:
+                        reason = f"Take Profit ({profit_pct*100:.1f}%)"
+                
+                # Stop Loss Check
+                # Loss = Current - Entry
+                # If Current > 3 * Entry (200% loss)
+                if current_price > (entry_price * (1 + self.stop_loss_pct)):
+                    reason = f"Stop Loss (Price > {1+self.stop_loss_pct}x)"
 
-            entry_price = float(pos["average_price"])
-            current_price = float(pos.get("current_price", 0))
-            lot_size = pos.get("lot_size", 1)
-            side = pos.get("side")
+            # 3. BUYER LOGIC (Long Options / Hedges)
+            elif side == "BUY":
+                # Hedges usually don't have Take Profits, they expire worthless or profit huge.
+                # But we can exit if they lost 90% value (Dead Hedge) to clean up?
+                # For VolGuard, we usually keep hedges until the core exits.
+                # Implementation: Logic here depends on if it's a "Hedge" or "Speculation".
+                pass
 
-            entry_credit = entry_price * lot_size
-
-            # ------------------------------
-            # PnL Calculation
-            # ------------------------------
-            if side == "SELL":
-                pnl = (entry_price - current_price) * lot_size
-            else:  # Hedge / Long
-                pnl = (current_price - entry_price) * lot_size
-
-            dte = self._days_to_expiry(pos.get("expiry"))
-
-            # ======================================================
-            # RULE 1 — HARD EXPIRY EXIT (T-1)
-            # ======================================================
-            if dte <= self.hard_expiry_days:
-                exits.append(self._exit(
-                    pos,
-                    "HARD_EXPIRY_EXIT",
-                    pnl
-                ))
-                continue
-
-            # ======================================================
-            # RULE 2 — PROFIT TARGET (SELLER)
-            # ======================================================
-            if side == "SELL" and pnl >= (entry_credit * self.profit_target):
-                exits.append(self._exit(
-                    pos,
-                    "PROFIT_TARGET_REACHED",
-                    pnl
-                ))
-                continue
-
-            # ======================================================
-            # RULE 3 — STOP LOSS (ABSOLUTE)
-            # ======================================================
-            if pnl <= -(entry_credit * self.stop_loss_multiple):
-                exits.append(self._exit(
-                    pos,
-                    "STOP_LOSS_TRIGGERED",
-                    pnl
-                ))
-                continue
+            # 4. GENERATE ORDER
+            if reason:
+                logger.info(f"Generating EXIT for {pos['symbol']}: {reason}")
+                
+                # Determine Exit Side
+                exit_side = "BUY" if side == "SELL" else "SELL"
+                
+                exits.append({
+                    "action": "EXIT",
+                    "instrument_key": pos["instrument_key"],
+                    "quantity": qty,
+                    "side": exit_side,
+                    "strategy": "EXIT_ENGINE",
+                    "reason": reason,
+                    "price": 0.0, # Market/Smart Limit
+                    "is_hedge": False
+                })
 
         return exits
 
-    # ======================================================
-    # Helpers
-    # ======================================================
-    def _exit(self, pos: Dict, reason: str, pnl: float) -> Dict:
-        logger.warning(
-            f"EXIT {reason} | {pos.get('symbol')} | PnL/Lot: {pnl:.2f}"
-        )
-
-        return {
-            "action": "CLOSE_POSITION",
-            "instrument_key": pos["instrument_key"],
-            "quantity": abs(pos["quantity"]),
-            "side": "BUY" if pos["side"] == "SELL" else "SELL",
-            "strategy": "EXIT",
-            "reason": f"{reason} | PnL/Lot={pnl:.2f}"
-        }
-
-    def _days_to_expiry(self, expiry) -> int:
-        if not expiry:
-            return 999
-
+    def _is_expiry_danger_zone(self, expiry_str: str) -> bool:
+        """
+        Checks if today is expiry day AND time is past cutoff.
+        """
+        if not expiry_str: return False
+        
         try:
-            if isinstance(expiry, str):
-                for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y"):
-                    try:
-                        expiry_dt = datetime.strptime(expiry, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    return 999
-            else:
-                expiry_dt = expiry
-
-            return (expiry_dt.date() - datetime.now().date()).days
-
+            today = datetime.now().date()
+            exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            
+            if exp_date == today:
+                now = datetime.now().time()
+                if now.hour > self.time_exit_hour or (now.hour == self.time_exit_hour and now.minute >= self.time_exit_minute):
+                    return True
         except Exception:
-            return 999
+            pass
+            
+        return False
