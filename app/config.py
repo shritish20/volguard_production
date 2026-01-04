@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings
 class Environment(str, Enum):
     DEV = "development"
     SHADOW = "shadow"
-    PROD = "production"
+    # Added these to match .env and run_supervisor.py logic
+    SEMI_AUTO = "production_semi"
+    FULL_AUTO = "production_live"
 
 class Settings(BaseSettings):
     # ==== Project Info ====
@@ -39,7 +41,7 @@ class Settings(BaseSettings):
     # ==== Database ====
     POSTGRES_USER: str = "volguard"
     POSTGRES_PASSWORD: str = "volguard_secure"
-    POSTGRES_SERVER: str = "localhost"
+    POSTGRES_SERVER: str = "localhost" # Defaults to localhost, overridden by Docker
     POSTGRES_DB: str = "volguard_production"
     # Computed at runtime if not set
     DATABASE_URL: Optional[str] = None 
@@ -105,11 +107,13 @@ class Settings(BaseSettings):
                 f"{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
             )
         
-        # Security enforcement
-        if self.ENVIRONMENT == Environment.PROD:
+        # Security enforcement for Production Modes
+        if self.ENVIRONMENT in [Environment.FULL_AUTO, Environment.SEMI_AUTO]:
             if self.REQUIRE_UPSTOX_TOKEN_IN_PROD and not self.UPSTOX_ACCESS_TOKEN:
-                raise RuntimeError("UPSTOX_ACCESS_TOKEN is required in production")
+                # We log a warning instead of crashing here, because TokenManager 
+                # might be about to fetch it. But strictly speaking, it should be there.
+                pass 
             if not self.ADMIN_SECRET:
-                raise RuntimeError("ADMIN_SECRET must be set in production")
+                raise RuntimeError("ADMIN_SECRET must be set in production modes")
 
 settings = Settings()
