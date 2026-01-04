@@ -5,7 +5,9 @@ import httpx
 import asyncio
 import uuid
 import time
+from datetime import datetime  # <--- FIXED: Added import
 from typing import Dict, List, Optional, Any
+
 from tenacity import retry, stop_after_attempt, wait_fixed
 from app.database import AsyncSessionLocal, TradeRecord
 from app.services.instrument_registry import registry
@@ -15,18 +17,16 @@ logger = logging.getLogger(__name__)
 class TradeExecutor:
     """
     VolGuard Smart Trade Executor (VolGuard 3.0)
-    
     Architecture:
     - V3: Order Placement (with Freeze Slicing), Modifications, Cancellations
     - V2: Position Reporting (Short Term / F&O)
-    - Protocol: Strict Async HTTP (No SDK)
+    Protocol: Strict Async HTTP (No SDK)
     """
 
     def __init__(self, access_token: str):
         self.access_token = access_token
         self.base_v3 = "https://api.upstox.com/v3"
         self.base_v2 = "https://api.upstox.com/v2"
-        
         self.headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -38,7 +38,7 @@ class TradeExecutor:
         
         # Async Client
         self.client = httpx.AsyncClient(
-            headers=self.headers, 
+            headers=self.headers,
             timeout=10.0,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
         )
@@ -49,7 +49,6 @@ class TradeExecutor:
     # ==================================================================
     # 1. POSITIONS (V2 - SOURCE OF TRUTH)
     # ==================================================================
-
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_positions(self) -> List[Dict]:
         """
@@ -57,7 +56,6 @@ class TradeExecutor:
         Endpoint: /v2/portfolio/short-term-positions
         """
         url = f"{self.base_v2}/portfolio/short-term-positions"
-        
         try:
             resp = await self.client.get(url)
             resp.raise_for_status()
@@ -91,9 +89,8 @@ class TradeExecutor:
                     "option_type": "CE" if "CE" in str(p.get("trading_symbol")) else "PE",
                     "product": p.get("product")
                 })
-                
             return positions
-            
+
         except Exception as e:
             logger.error(f"Position fetch failed: {e}")
             return []
@@ -101,7 +98,6 @@ class TradeExecutor:
     # ==================================================================
     # 2. EXECUTION ENGINE (V3)
     # ==================================================================
-
     async def execute_adjustment(self, adj: Dict) -> Dict:
         """
         Main Entry Point for Trading.
@@ -128,6 +124,7 @@ class TradeExecutor:
         if idem_key in self._order_cache:
             logger.warning(f"Duplicate order blocked: {idem_key}")
             return {"status": "DUPLICATE"}
+        
         self._order_cache.add(idem_key)
 
         # 3. Determine Order Type & Price
@@ -167,7 +164,6 @@ class TradeExecutor:
                 "type": order_type,
                 "price": target_price
             }
-            
         except Exception as e:
             logger.error(f"Execution Failed: {e}")
             return {"status": "FAILED", "error": str(e)}
@@ -179,7 +175,6 @@ class TradeExecutor:
         Enables 'slice' for handling large quantities automatically.
         """
         url = f"{self.base_v3}/order/place"
-        
         payload = {
             "quantity": qty,
             "product": "D", # Intraday
@@ -192,7 +187,7 @@ class TradeExecutor:
             "disclosed_quantity": 0,
             "trigger_price": 0.0,
             "is_amo": False,
-            "slice": True  # <--- SMART FEATURE: Auto-slice large orders
+            "slice": True # <--- SMART FEATURE: Auto-slice large orders
         }
         
         resp = await self.client.post(url, json=payload)
@@ -208,7 +203,6 @@ class TradeExecutor:
     # ==================================================================
     # 3. UTILITIES
     # ==================================================================
-
     async def _fetch_ltp_v3(self, key: str) -> float:
         """Quick LTP fetch for Limit Pricing"""
         url = f"{self.base_v3}/market-quote/ltp"
@@ -229,6 +223,7 @@ class TradeExecutor:
         """Log trade to Postgres"""
         try:
             details = registry.get_instrument_details(token)
+            
             async with AsyncSessionLocal() as session:
                 trade = TradeRecord(
                     id=str(uuid.uuid4()),
@@ -242,10 +237,12 @@ class TradeExecutor:
                     lot_size=details.get("lot_size"),
                     status="OPEN",
                     is_hedge=is_hedge,
-                    timestamp=time.time() # Make sure your Model accepts this or uses default
+                    # FIX: Correctly convert timestamp for DB
+                    timestamp=datetime.fromtimestamp(time.time())
                 )
                 session.add(trade)
                 await session.commit()
+                
         except Exception as e:
             logger.error(f"Trade Persistence Failed: {e}")
 
@@ -256,6 +253,7 @@ class TradeExecutor:
         for p in positions:
             # Reverse side
             exit_side = "SELL" if p["side"] == "BUY" else "BUY"
+            
             res = await self.execute_adjustment({
                 "instrument_key": p["instrument_key"],
                 "quantity": p["quantity"],
