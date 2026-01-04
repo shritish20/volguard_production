@@ -591,8 +591,8 @@ def measure_duration(metric: Histogram, **labels):
 # Global metrics collector instance
 collector = MetricsCollector()
 
-def record_order_placed(side: str, strategy: str, instrument_type: str, 
-                       order_type: str, status: str = 'PLACED'):
+def record_order_placed(side: str, strategy: str, instrument_type: str = "OPTION", 
+                       order_type: str = "MARKET", status: str = 'PLACED'):
     """Convenience function to record order placement"""
     orders_placed_total.labels(
         side=side,
@@ -634,7 +634,7 @@ def record_safety_violation(violation_type: str, severity: str = 'MEDIUM'):
         severity=severity
     ).inc()
 
-def set_system_state_simple(state: str):
+def set_system_state(state: str):
     """Set system state"""
     system_state.state(state)
 
@@ -642,16 +642,24 @@ def update_data_quality(quality_score: float):
     """Update data quality metric"""
     market_data_quality.set(quality_score)
 
-def update_component_health_simple(component: str, healthy: bool):
+def update_component_health(component: str, healthy: bool):
     """Update component health"""
     component_health.labels(component=component).set(1 if healthy else 0)
 
 # ============================================
-# ALIASES FOR BACKWARD COMPATIBILITY
+# ALIASES AND COMPATIBILITY FUNCTIONS
 # ============================================
 
-# Alias for supervisor_cycle_duration (used in supervisor.py)
+# Alias for backward compatibility
 cycle_duration = supervisor_cycle_duration
 
-# Alias for the collector method
-collector.update_portfolio_metrics = collector.update_portfolio_metrics_simple
+# Aliases for metric objects used in supervisor
+net_delta = position_delta
+data_quality_score = market_data_quality
+orders_placed = orders_placed_total
+orders_failed = orders_failed_total
+safety_violations = risk_limit_breaches
+
+# Simple aliases for functions
+set_system_state_simple = set_system_state
+update_component_health_simple = update_component_health
