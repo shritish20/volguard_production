@@ -1,13 +1,11 @@
 import pytest
 import pytest_asyncio
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock, AsyncMock
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import asyncio
 from app.config import Settings
 
-# Override settings for testing
 @pytest.fixture
 def test_settings():
     return Settings(
@@ -17,13 +15,10 @@ def test_settings():
         BASE_CAPITAL=1000000,
         MAX_DAILY_LOSS=20000,
         MAX_NET_DELTA=0.40,
-        MAX_SINGLE_LEG_DELTA=0.60,
         MAX_GAMMA=0.15,
         MAX_VEGA=1000,
-        MARGIN_SELL=120000,
-        MARGIN_BUY=30000,
         ADMIN_SECRET="test_admin_secret",
-        ENVIRONMENT="test"
+        ENVIRONMENT="development"  # Use allowed environment
     )
 
 @pytest.fixture
@@ -36,6 +31,7 @@ def mock_market_data():
 
 @pytest.fixture
 def mock_option_chain():
+    # Strikes aligned with spot 21500
     data = {
         'strike': [21000, 21100, 21200, 21300, 21400, 21500, 21600, 21700, 21800, 21900],
         'ce_key': [f"NSE_INDEX:Nifty 50-{i}-CE" for i in range(10)],
@@ -71,6 +67,7 @@ def mock_position():
 @pytest.fixture
 def mock_supervisor_dependencies():
     market = AsyncMock()
+    market.get_live_quote.return_value = {"NSE_INDEX|Nifty 50": 21500.50, "NSE_INDEX|India VIX": 14.2}
     market.get_spot_price.return_value = 21500.50
     market.get_vix.return_value = 14.2
     
