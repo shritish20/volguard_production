@@ -1,0 +1,80 @@
+name: VolGuard Chaos Monkey
+
+# Trigger on every push to main or pull request
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:  # Allows manual triggering button
+
+jobs:
+  chaos_testing:
+    runs-on: ubuntu-latest
+    
+    # Service Containers (The "Plumbing" for the test runner)
+    services:
+      # We need Redis because some imports might try to connect on load
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      # We need Postgres for the same reason (Schema loading)
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: volguard
+          POSTGRES_PASSWORD: volguard_secure
+          POSTGRES_DB: volguard_production
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+          # Ensure pytest-asyncio is installed for async tests
+          pip install pytest pytest-asyncio httpx redis
+
+      - name: Create Fake Environment Config
+        # We need a .env file so the config loader doesn't crash
+        run: |
+          echo "UPSTOX_ACCESS_TOKEN=mock_token" >> .env
+          echo "UPSTOX_BASE_V2=https://api.upstox.com/v2" >> .env
+          echo "UPSTOX_BASE_V3=https://api.upstox.com/v3" >> .env
+          echo "REDIS_URL=redis://localhost:6379/0" >> .env
+          echo "POSTGRES_SERVER=localhost" >> .env
+          echo "POSTGRES_USER=volguard" >> .env
+          echo "POSTGRES_PASSWORD=volguard_secure" >> .env
+          echo "POSTGRES_DB=volguard_production" >> .env
+          echo "ENVIRONMENT=shadow" >> .env
+          echo "BASE_CAPITAL=1000000" >> .env
+          echo "MAX_DAILY_LOSS=20000" >> .env
+
+      - name: 🐵 RUN CHAOS TESTS
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "🔥 unleash the chaos monkey..."
+          # -v for verbose, -s to see the print statements
+          pytest tests/test_chaos.py -v -s
