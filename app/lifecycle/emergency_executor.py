@@ -12,7 +12,7 @@ class SynchronousEmergencyExecutor:
     """
     def __init__(self, trade_executor):
         self.trade_executor = trade_executor
-        self.lock = asyncio.lock()
+        self.lock = asyncio.Lock()
         self.in_emergency = False
         self.emergency_history = []
 
@@ -80,3 +80,4 @@ class SynchronousEmergencyExecutor:
             "last_action": self.emergency_history[-1] if self.emergency_history else None,
             "history_count": len(self.emergency_history)
         }
+
