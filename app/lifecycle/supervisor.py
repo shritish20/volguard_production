@@ -34,10 +34,12 @@ from app.schemas.analytics import ExtMetrics, VolMetrics, RegimeResult
 # CRITICAL FIX: ACTUAL METRICS INTEGRATION
 # ============================================
 from app.utils.metrics import (
-    track_duration, cycle_duration, update_portfolio_metrics,
-    set_system_state, net_delta as net_delta_metric, data_quality_score,
+    supervisor_cycle_duration, update_portfolio_metrics,
+    set_system_state, position_delta as net_delta_metric, market_data_quality as data_quality_score,
     record_order_placed, record_order_failed, record_safety_violation,
-    orders_placed, orders_failed, safety_violations
+    orders_placed_total as orders_placed, orders_failed_total as orders_failed,
+    risk_limit_breaches as safety_violations,
+    track_duration  # Added missing import
 )
 
 logger = logging.getLogger(__name__)
@@ -198,162 +200,166 @@ class ProductionTradingSupervisor:
                 # ============================================
                 # ACTUAL METRICS: Track cycle duration
                 # ============================================
-                with cycle_duration.time():
-                    
-                    # PHASE 1: SMART DATA REFRESH
-                    if time.time() - self.last_intraday_fetch > self.intraday_fetch_interval:
-                        asyncio.create_task(self._refresh_intraday_data())
+                # Note: Removed .time() context manager as supervisor_cycle_duration is a Histogram, not a Timer
+                start_time = time.time()
+                
+                # PHASE 1: SMART DATA REFRESH
+                if time.time() - self.last_intraday_fetch > self.intraday_fetch_interval:
+                    asyncio.create_task(self._refresh_intraday_data())
 
-                    snapshot = await self._read_live_snapshot()
-                    valid, reason = self.quality.validate_snapshot(snapshot)
+                snapshot = await self._read_live_snapshot()
+                valid, reason = self.quality.validate_snapshot(snapshot)
 
-                    if not valid:
-                        self.consecutive_data_failures += 1
-                        logger.warning(f"[{cycle_id}] Data Invalid: {reason}")
-                        await self.safety.record_failure("DATA_QUALITY", {"reason": reason})
-                        cycle_log["error"] = reason
-                        cycle_log["data_valid"] = False
-
-                        # ============================================
-                        # ACTUAL METRICS: Update data quality
-                        # ============================================
-                        data_quality_score.set(0.0)
-                        record_safety_violation("DATA_QUALITY", "MEDIUM")
-
-                        # Circuit breaker: Too many data failures
-                        if self.consecutive_data_failures >= self.max_data_failures:
-                            logger.critical(f"[{cycle_id}] DATA CIRCUIT BREAKER TRIPPED!")
-                            await self.safety.record_failure("DATA_CIRCUIT_BREAKER", 
-                                {"failures": self.consecutive_data_failures}, "CRITICAL")
-                            self.safety.system_state = self.safety.system_state.HALTED
-                            set_system_state("HALTED")
-
-                        # Skip this cycle
-                        cycle_duration_actual = time.monotonic() - cycle_start_mono
-                        sleep_time = max(0, self.interval - cycle_duration_actual)
-                        await asyncio.sleep(sleep_time)
-                        next_tick += self.interval
-                        continue
-
-                    # Data is valid - reset failure counter
-                    self.consecutive_data_failures = 0
-                    await self.safety.record_success()
+                if not valid:
+                    self.consecutive_data_failures += 1
+                    logger.warning(f"[{cycle_id}] Data Invalid: {reason}")
+                    await self.safety.record_failure("DATA_QUALITY", {"reason": reason})
+                    cycle_log["error"] = reason
+                    cycle_log["data_valid"] = False
 
                     # ============================================
                     # ACTUAL METRICS: Update data quality
                     # ============================================
-                    data_quality_score.set(1.0)
-                    cycle_log["data_valid"] = True
+                    data_quality_score.set(0.0)
+                    record_safety_violation("DATA_QUALITY", "MEDIUM")
 
-                    # PHASE 2: POSITIONS & FUNDS
-                    self.positions = await self._update_positions(snapshot)
-                    funds = await self.cap_governor.get_available_funds()
+                    # Circuit breaker: Too many data failures
+                    if self.consecutive_data_failures >= self.max_data_failures:
+                        logger.critical(f"[{cycle_id}] DATA CIRCUIT BREAKER TRIPPED!")
+                        await self.safety.record_failure("DATA_CIRCUIT_BREAKER", 
+                            {"failures": self.consecutive_data_failures}, "CRITICAL")
+                        self.safety.system_state = self.safety.system_state.HALTED
+                        set_system_state("HALTED")
 
-                    # ============================================
-                    # ACTUAL METRICS: Update portfolio metrics
-                    # ============================================
-                    update_portfolio_metrics(
-                        list(self.positions.values()),
-                        self.cap_governor.daily_pnl,
-                        funds
+                    # Skip this cycle
+                    cycle_duration_actual = time.monotonic() - cycle_start_mono
+                    sleep_time = max(0, self.interval - cycle_duration_actual)
+                    await asyncio.sleep(sleep_time)
+                    next_tick += self.interval
+                    continue
+
+                # Data is valid - reset failure counter
+                self.consecutive_data_failures = 0
+                await self.safety.record_success()
+
+                # ============================================
+                # ACTUAL METRICS: Update data quality
+                # ============================================
+                data_quality_score.set(1.0)
+                cycle_log["data_valid"] = True
+
+                # PHASE 2: POSITIONS & FUNDS
+                self.positions = await self._update_positions(snapshot)
+                funds = await self.cap_governor.get_available_funds()
+
+                # ============================================
+                # ACTUAL METRICS: Update portfolio metrics
+                # ============================================
+                update_portfolio_metrics(
+                    list(self.positions.values()),
+                    self.cap_governor.daily_pnl,
+                    funds
+                )
+
+                # Calculate and export net delta
+                portfolio_delta = self._calc_net_delta()
+                net_delta_metric.labels(strategy='all').set(portfolio_delta)
+                cycle_log["portfolio_delta"] = portfolio_delta
+                cycle_log["positions_count"] = len(self.positions)
+
+                asyncio.create_task(self._update_capital_state())
+
+                # PHASE 3: RISK SCAN
+                risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions)
+                worst_case = risk_report.get("WORST_CASE", {}).get("impact", 0.0)
+                stress_block = False
+
+                if snapshot["spot"] > 0 and worst_case < -0.03 * snapshot["spot"]:
+                    stress_block = True
+                    logger.warning(f"[{cycle_id}] STRESS BLOCK ACTIVE (Worst: {worst_case:.2f})")
+                    record_safety_violation("STRESS_TEST_FAILED", "HIGH")
+
+                # PHASE 4: DECISION ENGINE
+                adjustments = []
+
+                # A. Exits (Always allowed)
+                exits = await self.exit_engine.evaluate_exits(list(self.positions.values()), snapshot)
+                adjustments.extend(exits)
+
+                # B. Hedges & Entries
+                if not exits:
+                    # Hedges
+                    hedges = await self.adj.evaluate_portfolio(
+                        {"aggregate_metrics": {"delta": portfolio_delta}},
+                        snapshot
+                    )
+                    adjustments.extend(hedges)
+
+                    # Entries
+                    can_enter_soft = (
+                        not self.positions and
+                        not hedges and
+                        not stress_block and
+                        (time.time() - self.last_entry_time > self.min_entry_interval)
                     )
 
-                    # Calculate and export net delta
-                    portfolio_delta = self._calc_net_delta()
-                    net_delta_metric.set(portfolio_delta)
-                    cycle_log["portfolio_delta"] = portfolio_delta
-                    cycle_log["positions_count"] = len(self.positions)
+                    if can_enter_soft:
+                        new_entries = await self._run_entry_logic(snapshot)
+                        adjustments.extend(new_entries)
+                        cycle_log["entries_generated"] = len(new_entries)
 
-                    asyncio.create_task(self._update_capital_state())
+                cycle_log["adjustments_count"] = len(adjustments)
 
-                    # PHASE 3: RISK SCAN
-                    risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions)
-                    worst_case = risk_report.get("WORST_CASE", {}).get("impact", 0.0)
-                    stress_block = False
+                # PHASE 5: EXECUTION
+                execution_results = []
+                for adj in adjustments:
+                    result = await self._process_adjustment(adj, snapshot, cycle_id)
+                    if result:
+                        execution_results.append(result)
+                        # ============================================
+                        # ACTUAL METRICS: Record order placement
+                        # ============================================
+                        if result.get("status") == "PLACED":
+                            record_order_placed(
+                                adj.get("side", "UNKNOWN"),
+                                adj.get("strategy", "UNKNOWN"),
+                                "OPTION",  # instrument_type
+                                "MARKET",  # order_type
+                                "PLACED"
+                            )
+                        elif result.get("status") == "FAILED":
+                            record_order_failed(result.get("reason", "UNKNOWN"))
 
-                    if snapshot["spot"] > 0 and worst_case < -0.03 * snapshot["spot"]:
-                        stress_block = True
-                        logger.warning(f"[{cycle_id}] STRESS BLOCK ACTIVE (Worst: {worst_case:.2f})")
-                        record_safety_violation("STRESS_TEST_FAILED", "HIGH")
+                cycle_log["executions"] = execution_results
 
-                    # PHASE 4: DECISION ENGINE
-                    adjustments = []
+                # ============================================
+                # ACTUAL METRICS: Export system state
+                # ============================================
+                set_system_state(self.safety.system_state.name)
+                
+                self.last_successful_cycle = time.time()
+                
+                # ============================================
+                # ACTUAL PERFORMANCE TRACKING
+                # ============================================
+                cycle_duration_actual = time.time() - start_time
+                supervisor_cycle_duration.labels(phase='full').observe(cycle_duration_actual)
+                self.cycle_times.append(cycle_duration_actual)
+                self.avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times)
+                
+                # Performance alert if slowing down
+                if len(self.cycle_times) >= 10 and self.avg_cycle_time > self.interval * 0.8:
+                    logger.warning(f"[{cycle_id}] Performance degradation: avg cycle = {self.avg_cycle_time:.3f}s")
 
-                    # A. Exits (Always allowed)
-                    exits = await self.exit_engine.evaluate_exits(list(self.positions.values()), snapshot)
-                    adjustments.extend(exits)
-
-                    # B. Hedges & Entries
-                    if not exits:
-                        # Hedges
-                        hedges = await self.adj.evaluate_portfolio(
-                            {"aggregate_metrics": {"delta": portfolio_delta}},
-                            snapshot
-                        )
-                        adjustments.extend(hedges)
-
-                        # Entries
-                        can_enter_soft = (
-                            not self.positions and
-                            not hedges and
-                            not stress_block and
-                            (time.time() - self.last_entry_time > self.min_entry_interval)
-                        )
-
-                        if can_enter_soft:
-                            new_entries = await self._run_entry_logic(snapshot)
-                            adjustments.extend(new_entries)
-                            cycle_log["entries_generated"] = len(new_entries)
-
-                    cycle_log["adjustments_count"] = len(adjustments)
-
-                    # PHASE 5: EXECUTION
-                    execution_results = []
-                    for adj in adjustments:
-                        result = await self._process_adjustment(adj, snapshot, cycle_id)
-                        if result:
-                            execution_results.append(result)
-                            # ============================================
-                            # ACTUAL METRICS: Record order placement
-                            # ============================================
-                            if result.get("status") == "PLACED":
-                                record_order_placed(
-                                    adj.get("side", "UNKNOWN"),
-                                    adj.get("strategy", "UNKNOWN"),
-                                    "PLACED"
-                                )
-                            elif result.get("status") == "FAILED":
-                                record_order_failed(result.get("reason", "UNKNOWN"))
-
-                    cycle_log["executions"] = execution_results
-
-                    # ============================================
-                    # ACTUAL METRICS: Export system state
-                    # ============================================
-                    set_system_state(self.safety.system_state.name)
-                    
-                    self.last_successful_cycle = time.time()
-                    
-                    # ============================================
-                    # ACTUAL PERFORMANCE TRACKING
-                    # ============================================
-                    cycle_duration_actual = time.time() - cycle_start_wall
-                    self.cycle_times.append(cycle_duration_actual)
-                    self.avg_cycle_time = sum(self.cycle_times) / len(self.cycle_times)
-                    
-                    # Performance alert if slowing down
-                    if len(self.cycle_times) >= 10 and self.avg_cycle_time > self.interval * 0.8:
-                        logger.warning(f"[{cycle_id}] Performance degradation: avg cycle = {self.avg_cycle_time:.3f}s")
-
-                    # ============================================
-                    # ACTUAL LOG: Cycle summary
-                    # ============================================
-                    logger.info(
-                        f"[{cycle_id}] Cycle complete in {cycle_duration_actual*1000:.1f}ms | "
-                        f"Positions: {len(self.positions)} | Delta: {portfolio_delta:.2f} | "
-                        f"Adjustments: {len(adjustments)} | Executed: {len(execution_results)} | "
-                        f"Avg cycle: {self.avg_cycle_time*1000:.1f}ms"
-                    )
+                # ============================================
+                # ACTUAL LOG: Cycle summary
+                # ============================================
+                logger.info(
+                    f"[{cycle_id}] Cycle complete in {cycle_duration_actual*1000:.1f}ms | "
+                    f"Positions: {len(self.positions)} | Delta: {portfolio_delta:.2f} | "
+                    f"Adjustments: {len(adjustments)} | Executed: {len(execution_results)} | "
+                    f"Avg cycle: {self.avg_cycle_time*1000:.1f}ms"
+                )
 
             except asyncio.CancelledError:
                 logger.info(f"[{cycle_id}] Cycle cancelled")
@@ -767,4 +773,4 @@ class ProductionTradingSupervisor:
             "positions_count": len(self.positions),
             "system_state": self.safety.system_state.name,
             "execution_mode": self.safety.execution_mode.value
-                }
+                    }
