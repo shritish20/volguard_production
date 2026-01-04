@@ -1,11 +1,17 @@
+# app/core/trading/strategies.py
+
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 @dataclass
 class StrategyDefinition:
+    """
+    Blueprint for a Trading Strategy.
+    Consumed by: StrategySelector (to pick) and LegBuilder (to build orders).
+    """
     name: str
     allowed_regimes: List[str]
-    structure: str                  # STRANGLE, CONDOR, FLY, SPREAD, RATIO
+    structure: str                  # STRANGLE, CONDOR, FLY, SPREAD, RATIO, CONDOR_BWB
     risk_type: str                  # DEFINED, UNDEFINED
     
     # Deltas
