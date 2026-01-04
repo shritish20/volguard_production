@@ -1,158 +1,145 @@
 # app/services/instrument_registry.py
 
-import gzip
-import json
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+import httpx
 import logging
 import os
-import httpx
-import threading
+import gzip
+import io
+import json
+from datetime import datetime, date
+from typing import Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
-
 class InstrumentRegistry:
     """
-    Single source of truth for instrument metadata.
-    Thread-safe, cached, and production-safe.
+    VolGuard Smart Registry (VolGuard 3.0)
+    
+    Responsibilities:
+    1. MASTER DATA: Downloads & Caches Upstox Contract Master (Verified JSON).
+    2. RESOLUTION: Converts Symbols <-> Tokens.
+    3. METADATA: Provides Lot Size, Tick Size, Freeze Limits.
+    4. DYNAMIC CONTRACTS: Finds 'Current Month Future' automatically.
     """
 
-    _instance = None
-    _lock = threading.Lock()
+    def __init__(self, cache_file: str = "instruments_cache.json"):
+        self.cache_file = cache_file
+        self.master_df = pd.DataFrame()
+        self.symbol_map = {} 
+        self.token_map = {}  
+        self.last_update = None
 
-    MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    DEFAULT_PATH = "data/complete.json.gz"
-    MAX_FILE_AGE_DAYS = 1  # Re-download daily
+    def load_master(self, force_refresh: bool = False):
+        """
+        Loads master contract file. 
+        Tries local cache first, else downloads from Upstox.
+        """
+        # 1. Try Local Cache
+        if not force_refresh and os.path.exists(self.cache_file):
+            file_time = datetime.fromtimestamp(os.path.getmtime(self.cache_file)).date()
+            if file_time == date.today():
+                logger.info("Loading instruments from local cache...")
+                try:
+                    self.master_df = pd.read_json(self.cache_file)
+                    # JSON serialization turns timestamps to ints, need to convert back if loading from cache
+                    if 'expiry' in self.master_df.columns:
+                         self.master_df['expiry'] = pd.to_datetime(self.master_df['expiry'], unit='ms', errors='ignore')
+                    self._build_maps()
+                    return
+                except Exception as e:
+                    logger.warning(f"Cache corrupt, forcing download: {e}")
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._data = None
-            cls._instance._index = {}
-            cls._instance._loaded_at = None
-        return cls._instance
-
-    # --------------------------------------------------
-    # LOADING
-    # --------------------------------------------------
-    def load_master(self, file_path: str = DEFAULT_PATH):
-        with self._lock:
-            if self._data is not None:
-                return
-
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            if self._needs_refresh(file_path):
-                logger.info("Instrument master missing or stale. Downloading...")
-                self._download_master(file_path)
-
-            try:
-                with gzip.open(file_path, "rt", encoding="utf-8") as f:
-                    raw = json.load(f)
-
-                df = pd.DataFrame(raw)
-
-                # Defensive schema normalization
-                required_cols = {
-                    "instrument_key", "exchange", "instrument_type",
-                    "name", "expiry", "lot_size", "strike_price"
-                }
-                missing = required_cols - set(df.columns)
-                if missing:
-                    raise ValueError(f"Instrument master missing columns: {missing}")
-
-                df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
-                df["lot_size"] = pd.to_numeric(df["lot_size"], errors="coerce").fillna(0).astype(int)
-                df["strike_price"] = pd.to_numeric(df["strike_price"], errors="coerce").fillna(0.0)
-
-                # Index for fast lookup
-                self._index = df.set_index("instrument_key").to_dict("index")
-                self._data = df
-                self._loaded_at = datetime.utcnow()
-
-                logger.info(f"Instrument registry loaded: {len(df)} instruments")
-
-            except Exception as e:
-                logger.critical(f"Failed to load instrument master: {e}")
-                raise
-
-    def _needs_refresh(self, file_path: str) -> bool:
-        if not os.path.exists(file_path):
-            return True
-
-        age = datetime.utcnow() - datetime.utcfromtimestamp(os.path.getmtime(file_path))
-        return age > timedelta(days=self.MAX_FILE_AGE_DAYS)
-
-    def _download_master(self, file_path: str):
+        # 2. Download Fresh
+        logger.info("Downloading fresh instrument master from Upstox (JSON)...")
         try:
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.get(self.MASTER_URL)
+            url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+            
+            with httpx.Client() as client:
+                resp = client.get(url, timeout=60.0)
                 resp.raise_for_status()
-                with open(file_path, "wb") as f:
-                    f.write(resp.content)
-            logger.info("Instrument master download complete.")
+                
+                with gzip.open(io.BytesIO(resp.content), 'rt', encoding='utf-8') as f:
+                    data = json.load(f)
+            
+            # 3. Process Data
+            temp_df = pd.DataFrame(data)
+            
+            # Normalization (Handle naming variations)
+            if 'trading_symbol' in temp_df.columns:
+                temp_df.rename(columns={'trading_symbol': 'tradingsymbol'}, inplace=True)
+            
+            # 4. Filter for Equity Derivatives (NSE_FO) & Nifty Indices
+            # Note: Upstox JSON 'segment' is usually "NSE_FO" for F&O
+            # We also filter for NIFTY/BANKNIFTY to keep RAM usage low (~10k rows vs 80k)
+            self.master_df = temp_df[
+                (temp_df['segment'] == 'NSE_FO') & 
+                (temp_df['tradingsymbol'].str.contains('NIFTY|BANKNIFTY|FINNIFTY', case=False, na=False))
+            ].copy()
+            
+            # 5. Fix Expiry (Critical: Convert ms timestamp to datetime)
+            if 'expiry' in self.master_df.columns:
+                # Upstox sends expiry as 1774463399000 (ms)
+                self.master_df['expiry'] = pd.to_datetime(self.master_df['expiry'], unit='ms')
+            
+            # Save to cache
+            self.master_df.to_json(self.cache_file, index=False)
+            self._build_maps()
+            logger.info(f"Instrument Master Loaded: {len(self.master_df)} contracts")
+            
         except Exception as e:
-            logger.critical(f"Instrument master download failed: {e}")
-            raise
+            logger.critical(f"Failed to download Instrument Master: {e}")
+            # Fallback
+            if os.path.exists(self.cache_file):
+                logger.warning("Using stale cache due to download failure.")
+                self.master_df = pd.read_json(self.cache_file)
+                self._build_maps()
+            else:
+                raise RuntimeError("Instrument Registry Failed: No Data Available")
 
-    # --------------------------------------------------
-    # LOOKUPS
-    # --------------------------------------------------
+    def _build_maps(self):
+        """Indexing for O(1) lookups"""
+        if self.master_df.empty:
+            return
+
+        self.token_map = self.master_df.set_index('instrument_key').to_dict('index')
+        self.symbol_map = dict(zip(self.master_df['tradingsymbol'], self.master_df['instrument_key']))
+
     def get_instrument_details(self, instrument_key: str) -> Dict:
-        if self._data is None:
-            self.load_master()
+        return self.token_map.get(instrument_key, {})
 
-        item = self._index.get(instrument_key)
-        if not item:
-            return {}
+    def get_token_by_symbol(self, symbol: str) -> Optional[str]:
+        return self.symbol_map.get(symbol)
 
-        return {
-            "symbol": item.get("trading_symbol"),
-            "strike": float(item.get("strike_price", 0.0)),
-            "lot_size": int(item.get("lot_size", 0)),
-            "expiry": item.get("expiry"),
-            "name": item.get("name"),
-        }
-
-    def get_current_future(self, symbol: str = "NIFTY") -> Optional[str]:
-        if self._data is None:
-            self.load_master()
-
-        today = datetime.utcnow()
-        target_names = {symbol, f"{symbol} 50", symbol.upper(), f"{symbol.upper()} 50"}
-
-        df = self._data
-        mask = (
-            (df["exchange"] == "NSE")
-            & (df["instrument_type"] == "FUT")
-            & (df["name"].isin(target_names))
-            & (df["expiry"] >= today)
-        )
-
-        futures = df.loc[mask].sort_values("expiry")
-        if futures.empty:
+    def get_current_future(self, underlying: str = "NIFTY") -> Optional[str]:
+        """
+        Smart Resolution: Finds the current month's Future token.
+        """
+        try:
+            # Filter for Futures of the underlying
+            futs = self.master_df[
+                (self.master_df['instrument_type'] == 'FUT') & 
+                (self.master_df['tradingsymbol'].str.startswith(underlying))
+            ].copy()
+            
+            if futs.empty:
+                return None
+            
+            # Sort by expiry
+            futs = futs.sort_values('expiry')
+            
+            # Find first expiry >= Today
+            today = pd.Timestamp.now().normalize()
+            valid_futs = futs[futs['expiry'] >= today]
+            
+            if valid_futs.empty:
+                return None
+                
+            return valid_futs.iloc[0]['instrument_key']
+            
+        except Exception as e:
+            logger.error(f"Future resolution failed: {e}")
             return None
 
-        return futures.iloc[0]["instrument_key"]
-
-    def get_option_symbols(self, underlying: str = "NIFTY") -> List[str]:
-        if self._data is None:
-            self.load_master()
-
-        today = datetime.utcnow()
-        target_names = {underlying, f"{underlying} 50", underlying.upper(), f"{underlying.upper()} 50"}
-
-        df = self._data
-        mask = (
-            (df["exchange"] == "NSE")
-            & (df["instrument_type"].isin(["CE", "PE"]))
-            & (df["name"].isin(target_names))
-            & (df["expiry"] >= today)
-        )
-
-        return df.loc[mask, "instrument_key"].tolist()
-
-
+# Global Singleton Instance
 registry = InstrumentRegistry()
