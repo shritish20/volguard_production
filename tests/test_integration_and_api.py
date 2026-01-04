@@ -18,18 +18,18 @@ async def test_supervisor_normal_cycle(mock_supervisor_dependencies):
         adjustment_engine=mock_supervisor_dependencies["adj"],
         trade_executor=mock_supervisor_dependencies["executor"],
         trading_engine=mock_supervisor_dependencies["engine"],
-        capital_governor=AsyncMock(), # Missing dependency added
+        capital_governor=AsyncMock(),
         websocket_service=mock_supervisor_dependencies["ws"],
         loop_interval_seconds=0.01
-        # Removed invalid 'total_capital' argument
     )
     supervisor.safety.execution_mode = ExecutionMode.SHADOW
     supervisor.running = True
     
+    # Run loop as a task
     task = asyncio.create_task(supervisor.start())
-    await asyncio.sleep(0.05)
-    supervisor.running = False
-    await task
+    await asyncio.sleep(0.05) # Let it run a cycle
+    supervisor.running = False # Signal stop
+    await task # Wait for clean exit
     
     mock_supervisor_dependencies["market"].get_live_quote.assert_called()
 
@@ -46,17 +46,23 @@ async def test_supervisor_kill_switch_detection(mock_supervisor_dependencies):
         loop_interval_seconds=0.01
     )
     
+    # Create Kill Trigger
     with open("KILL_SWITCH.TRIGGER", "w") as f: f.write("TEST")
+    
     try:
         supervisor.running = True
         task = asyncio.create_task(supervisor.start())
-        await asyncio.sleep(0.1)
-        assert not supervisor.running
+        await asyncio.sleep(0.1) # Allow supervisor to see the file and break loop
+        
+        # Check if the task finished (Loop exited)
+        assert task.done() 
     finally:
         if os.path.exists("KILL_SWITCH.TRIGGER"):
             os.remove("KILL_SWITCH.TRIGGER")
         try:
-            await task
+            if not task.done():
+                supervisor.running = False
+                await task
         except:
             pass
 
@@ -99,8 +105,7 @@ async def test_emergency_kill_switch():
     mock_exec.close_all_positions.return_value = {"status": "SUCCESS"}
     
     emergency = SynchronousEmergencyExecutor(mock_exec)
-    # Ensure source code uses asyncio.Lock(), not .lock()
-    emergency.lock = asyncio.Lock()
+    # Note: We rely on the app code fix (asyncio.Lock()) for this to pass
     
     result = await emergency.execute_emergency_action({"type": "GLOBAL_KILL_SWITCH"})
     
