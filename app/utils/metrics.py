@@ -38,8 +38,8 @@ orders_failed_total = Counter(
 order_execution_duration = Histogram(
     'volguard_order_execution_duration_seconds',
     'Time taken to execute an order',
-    [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],  # buckets
-    ['order_type', 'side']  # labelnames
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+    labelnames=['order_type', 'side']
 )
 
 # Position metrics
@@ -106,8 +106,8 @@ cumulative_pnl = Gauge(
 supervisor_cycle_duration = Histogram(
     'volguard_supervisor_cycle_duration_seconds',
     'Duration of supervisor cycles',
-    [0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0],  # buckets
-    ['phase']  # labelnames
+    buckets=[0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
+    labelnames=['phase']
 )
 
 cycle_overrun = Counter(
@@ -118,13 +118,13 @@ cycle_overrun = Counter(
 data_fetch_duration = Histogram(
     'volguard_data_fetch_duration_seconds',
     'Time taken to fetch market data',
-    ['data_source', 'data_type']
+    labelnames=['data_source', 'data_type']
 )
 
 risk_calc_duration = Histogram(
     'volguard_risk_calc_duration_seconds',
     'Time taken for risk calculations',
-    ['calculation_type']
+    labelnames=['calculation_type']
 )
 
 decision_duration = Histogram(
@@ -232,7 +232,7 @@ connection_errors = Counter(
 api_call_duration = Histogram(
     'volguard_api_call_duration_seconds',
     'Duration of API calls to external services',
-    ['service', 'endpoint', 'status']
+    labelnames=['service', 'endpoint', 'status']
 )
 
 api_call_errors = Counter(
