@@ -4,6 +4,9 @@ PRODUCTION-READY Metrics System for VolGuard
 Exports comprehensive Prometheus metrics for monitoring and alerting.
 """
 import time
+import platform
+import socket
+import sys
 from prometheus_client import Counter, Histogram, Gauge, Info, Summary, Enum
 from functools import wraps
 import asyncio
@@ -35,8 +38,8 @@ orders_failed_total = Counter(
 order_execution_duration = Histogram(
     'volguard_order_execution_duration_seconds',
     'Time taken to execute an order',
-    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
-    ['order_type', 'side']
+    [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],  # buckets
+    ['order_type', 'side']  # labelnames
 )
 
 # Position metrics
@@ -103,8 +106,8 @@ cumulative_pnl = Gauge(
 supervisor_cycle_duration = Histogram(
     'volguard_supervisor_cycle_duration_seconds',
     'Duration of supervisor cycles',
-    buckets=[0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
-    ['phase']
+    [0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0],  # buckets
+    ['phase']  # labelnames
 )
 
 cycle_overrun = Counter(
@@ -632,7 +635,3 @@ def update_data_quality(quality_score: float):
 def update_component_health_simple(component: str, healthy: bool):
     """Update component health"""
     component_health.labels(component=component).set(1 if healthy else 0)
-
-# Import platform and socket for system info
-import platform
-import socket
