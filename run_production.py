@@ -2,158 +2,101 @@
 
 import asyncio
 import logging
-import subprocess
-import sys
-import signal
 import os
-import time
+from dotenv import load_dotenv
 
-from app.utils.logging import setup_logging
-logger = setup_logging()
+# Import Core Components
+from app.core.auth.token_manager import TokenManager
+from app.services.instrument_registry import registry
+from app.core.market.data_client import MarketDataClient
+from app.core.market.websocket_client import MarketDataFeed
+from app.core.risk.engine import RiskEngine
+from app.core.risk.capital_governor import CapitalGovernor
+from app.core.trading.executor import TradeExecutor
+from app.core.trading.engine import TradingEngine
+from app.core.trading.adjustment_engine import AdjustmentEngine
+from app.lifecycle.supervisor import ProductionTradingSupervisor
 
-_shutdown = False
-
-
-def _handle_shutdown(sig, frame):
-    global _shutdown
-    logger.warning(f"Received shutdown signal ({sig}). Preparing graceful exit...")
-    _shutdown = True
-
-
-# Register signal handlers (Docker / K8s safe)
-signal.signal(signal.SIGTERM, _handle_shutdown)
-signal.signal(signal.SIGINT, _handle_shutdown)
-
+# Setup Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("volguard_production.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("VolGuardMain")
 
 async def main():
-    # ======================================================
-    # 1. TOKEN REFRESH (STRICT)
-    # ======================================================
-    logger.info("🔐 Running token refresh sequence...")
-    try:
-        result = subprocess.run(
-            [sys.executable, "scripts/token_manager.py"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            logger.error("❌ Token refresh script failed.")
-            logger.error(result.stderr)
-            return
-        logger.info("✅ Token refresh completed.")
-    except Exception as e:
-        logger.critical(f"❌ Token manager execution failed: {e}")
+    # 1. Load Config
+    load_dotenv()
+    ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
+    REFRESH_TOKEN = os.getenv("UPSTOX_REFRESH_TOKEN") # Optional
+    CLIENT_ID = os.getenv("UPSTOX_CLIENT_ID")
+    CLIENT_SECRET = os.getenv("UPSTOX_CLIENT_SECRET")
+    
+    if not ACCESS_TOKEN:
+        logger.critical("No Access Token found in .env")
         return
 
-    # ======================================================
-    # 2. DELAYED IMPORTS (MANDATORY)
-    # ======================================================
-    from app.config import settings
-    from app.database import init_db
-    from app.lifecycle.supervisor import ProductionTradingSupervisor
-    from app.core.market.data_client import MarketDataClient
-    from app.core.risk.engine import RiskEngine
-    from app.core.trading.adjustment_engine import AdjustmentEngine
-    from app.core.trading.executor import TradeExecutor
-    from app.core.trading.engine import TradingEngine
-    from app.core.market.websocket_client import UpstoxFeedService
-    from app.lifecycle.safety_controller import ExecutionMode
+    # 2. Auth & Token Check
+    auth = TokenManager(ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_ID, CLIENT_SECRET)
+    if not auth.validate_token():
+        logger.critical("Authentication Failed. Exiting.")
+        return
+    
+    valid_token = auth.get_token()
 
-    logger.info(
-        f"🚀 Booting {settings.PROJECT_NAME} | Env={settings.ENVIRONMENT}"
-    )
-
-    # ======================================================
-    # 3. DATABASE INIT
-    # ======================================================
-    logger.info("📦 Initializing database...")
-    await init_db()
-
-    # ======================================================
-    # 4. MARKET CLIENT
-    # ======================================================
-    market = MarketDataClient(
-        settings.UPSTOX_ACCESS_TOKEN,
-        settings.UPSTOX_BASE_V2,
-        settings.UPSTOX_BASE_V3,
-    )
-
-    # Hard token validation
+    # 3. Load Master Registry (The Map)
     try:
-        price = await market.get_spot_price()
-        if price <= 0:
-            raise RuntimeError("Spot price invalid")
-        logger.info("✅ Upstox token validated.")
+        registry.load_master()
     except Exception as e:
-        logger.critical(f"❌ Upstox token invalid: {e}")
+        logger.critical(f"Registry Load Failed: {e}")
         return
 
-    # ======================================================
-    # 5. ENGINE INITIALIZATION
-    # ======================================================
-    config = settings.model_dump()
+    # 4. Initialize Core Systems
+    logger.info("Initializing VolGuard 3.0 Cores...")
+    
+    # Clients
+    market_client = MarketDataClient(valid_token)
+    ws_client = MarketDataFeed(valid_token, ["NSE_INDEX|Nifty 50", "NSE_INDEX|India VIX"])
+    
+    # Engines
+    risk_engine = RiskEngine(max_portfolio_loss=50000)
+    cap_governor = CapitalGovernor(valid_token, total_capital=200000) # Fetches real funds dynamically
+    executor = TradeExecutor(valid_token)
+    
+    # Trading Engine (Passes Client & Config)
+    trading_engine = TradingEngine(market_client, {"DEFAULT_LOT_SIZE": 50})
+    
+    # Adjustment Engine
+    adj_engine = AdjustmentEngine(delta_threshold=15.0)
 
-    risk = RiskEngine(config)
-    adj = AdjustmentEngine(config)
-    executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
-    engine = TradingEngine(market, config)
-
-    # ======================================================
-    # 6. WEBSOCKET (OPTIONAL, GUARDED)
-    # ======================================================
-    ws = None
-    if settings.SUPERVISOR_WEBSOCKET_ENABLED:
-        try:
-            ws = UpstoxFeedService(settings.UPSTOX_ACCESS_TOKEN)
-            await ws.connect()
-            logger.info("📡 WebSocket connected.")
-        except Exception as e:
-            logger.error(f"WebSocket disabled due to error: {e}")
-            ws = None
-
-    # ======================================================
-    # 7. SUPERVISOR
-    # ======================================================
-    sup = ProductionTradingSupervisor(
-        market_client=market,
-        risk_engine=risk,
-        adjustment_engine=adj,
+    # 5. Boot Supervisor
+    supervisor = ProductionTradingSupervisor(
+        market_client=market_client,
+        risk_engine=risk_engine,
+        adjustment_engine=adj_engine,
         trade_executor=executor,
-        trading_engine=engine,
-        websocket_service=ws,
-        loop_interval_seconds=settings.SUPERVISOR_LOOP_INTERVAL,
-        total_capital=settings.BASE_CAPITAL,
+        trading_engine=trading_engine,
+        capital_governor=cap_governor,
+        websocket_service=ws_client
     )
 
-    # Execution Mode
-    if settings.ENVIRONMENT == "production_live":
-        logger.warning("⚠️ FULL_AUTO MODE (REAL MONEY)")
-        sup.safety.execution_mode = ExecutionMode.FULL_AUTO
-    elif settings.ENVIRONMENT == "production_semi":
-        logger.info("SEMI_AUTO MODE (Approvals Required)")
-        sup.safety.execution_mode = ExecutionMode.SEMI_AUTO
-    else:
-        logger.info("SHADOW MODE (Default)")
-        sup.safety.execution_mode = ExecutionMode.SHADOW
-
-    # ======================================================
-    # 8. RUN LOOP (AUTO-RESTART)
-    # ======================================================
-    logger.info("🧠 Supervisor started.")
-
     try:
-        while not _shutdown:
-            try:
-                await sup.start()
-            except Exception as e:
-                logger.critical("Supervisor crashed. Restarting in 5s.", exc_info=True)
-                await asyncio.sleep(5)
+        logger.info(">>> STARTING SUPERVISOR <<<")
+        await supervisor.start()
+    except KeyboardInterrupt:
+        logger.info("Shutdown Signal Received.")
+    except Exception as e:
+        logger.critical(f"Fatal Crash: {e}")
     finally:
-        logger.info("🛑 Shutting down gracefully...")
-        await market.close()
-        if ws:
-            await ws.disconnect()
-
+        # Cleanup
+        await market_client.close()
+        await cap_governor.close()
+        await executor.close()
+        logger.info("VolGuard Shutdown Complete.")
 
 if __name__ == "__main__":
     asyncio.run(main())
