@@ -9,115 +9,80 @@ import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 
-# ==========================================================
-# ENV SETUP
-# ==========================================================
+# Load Environment
 load_dotenv()
 
-# DO NOT reuse broker tokens for admin control
-ADMIN_KEY = os.getenv("VOLGUARD_ADMIN_KEY")
-API_BASE = os.getenv("VOLGUARD_API_URL", "http://localhost:8000")
-
-API_ENDPOINT = f"{API_BASE}/api/v1/admin/emergency_stop"
+# Configuration
+API_URL = os.getenv("API_URL", "http://localhost:8000") # Adjust port if needed
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 KILL_FILE = "KILL_SWITCH.TRIGGER"
 
-
-# ==========================================================
-# UTILITIES
-# ==========================================================
 def atomic_write(path: str, content: str):
-    """Atomic file write to prevent corruption"""
+    """
+    Atomic write ensures the Supervisor doesn't read a half-written file.
+    """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     with tempfile.NamedTemporaryFile("w", dir=directory, delete=False) as tf:
         tf.write(content)
         temp_name = tf.name
     os.replace(temp_name, path)
 
+def main():
+    print("\n" + "!"*60)
+    print("🚨  VOLGUARD EMERGENCY STOP INITIATED  🚨")
+    print("!"*60 + "\n")
+    
+    print("This will:")
+    print("1. Send STOP signal to Trading API.")
+    print("2. Create filesystem Lock File (Hard Kill).")
+    print("3. Force all loops to terminate immediately.\n")
 
-def build_kill_payload(reason: str) -> dict:
-    return {
+    # 1. Confirmation
+    confirm = input("Type 'KILL' to confirm: ").strip()
+    if confirm != "KILL":
+        print("❌ Aborted.")
+        return
+
+    reason = input("Enter Reason (Required): ").strip()
+    if not reason:
+        print("❌ Reason is required.")
+        return
+
+    payload = {
         "action": "GLOBAL_KILL_SWITCH",
         "reason": reason,
         "timestamp": datetime.utcnow().isoformat(),
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "initiator": "MANUAL_SCRIPT",
+        "initiator": f"MANUAL_SCRIPT@{socket.gethostname()}"
     }
 
-
-# ==========================================================
-# MAIN LOGIC
-# ==========================================================
-def main():
-    print("\n🚨🚨🚨 VOLGUARD EMERGENCY STOP 🚨🚨🚨\n")
-    print("This action will:")
-    print("  • Stop all trading loops")
-    print("  • Force-close open positions")
-    print("  • Lock system in EMERGENCY mode\n")
-
-    if not ADMIN_KEY:
-        print("❌ VOLGUARD_ADMIN_KEY not set in environment.")
-        sys.exit(1)
-
-    confirm = input("Type 'KILL' to confirm: ").strip()
-    if confirm != "KILL":
-        print("Aborted.")
-        return
-
-    reason = input("Enter reason (required): ").strip()
-    if not reason:
-        print("❌ Reason is mandatory.")
-        return
-
-    payload = build_kill_payload(reason)
-    headers = {
-        "X-Admin-Key": ADMIN_KEY,
-        "Content-Type": "application/json",
-    }
-
-    # ======================================================
-    # PRIMARY: API SIGNAL
-    # ======================================================
+    # 2. Try Graceful API Kill
+    print(f"\n📡 Attempting API Kill ({API_URL})...")
     try:
-        print(f"\n📡 Sending kill signal to {API_ENDPOINT} ...")
-        resp = requests.post(
-            API_ENDPOINT,
-            headers=headers,
-            json=payload,
-            timeout=5,
-        )
-
+        headers = {"x-admin-key": ADMIN_SECRET, "Content-Type": "application/json"}
+        # Adjust endpoint to match your API router if you created one, 
+        # otherwise this log serves as the record.
+        # Since we haven't built a specific API endpoint for this in dashboard.py, 
+        # we rely heavily on the FILE fallback, but this request helps if you add the route later.
+        
+        # NOTE: If you haven't added an endpoint for this in dashboard.py, this might 404.
+        # That is fine, the fallback is the real key.
+        resp = requests.post(f"{API_URL}/api/v1/system/emergency_stop", json=payload, headers=headers, timeout=3)
         if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") in ("KILLED", "EMERGENCY"):
-                print("\n✅ SUCCESS: System acknowledged emergency stop.")
-                print(json.dumps(data, indent=2))
-                return
-            else:
-                print("\n⚠️ API responded but did not confirm kill:")
-                print(data)
-
+            print("✅ API Acknowledged Stop Command.")
         else:
-            print(f"\n❌ API ERROR {resp.status_code}")
-            print(resp.text)
-
+            print(f"⚠️ API did not acknowledge (Status: {resp.status_code}). Proceeding to Hard Kill.")
     except Exception as e:
-        print(f"\n❌ API unreachable: {e}")
+        print(f"⚠️ API Unreachable ({e}). Proceeding to Hard Kill.")
 
-    # ======================================================
-    # FALLBACK: FILE-BASED KILL SWITCH
-    # ======================================================
-    print("\n🆘 FALLBACK ACTIVATED: Writing KILL_SWITCH.TRIGGER file")
-
+    # 3. Hard Kill (File System)
+    print("\n🔒 Engaging Hard Kill Switch (File System)...")
     try:
         atomic_write(KILL_FILE, json.dumps(payload, indent=2))
-        print(f"✅ Kill switch file created at {os.path.abspath(KILL_FILE)}")
-        print("Supervisor will halt on next cycle.")
+        print(f"✅ SUCCESS: Kill file created at {os.path.abspath(KILL_FILE)}")
+        print("The Supervisor will detect this within 3 seconds and shut down.")
     except Exception as e:
-        print(f"❌ FAILED to write kill file: {e}")
-        sys.exit(2)
+        print(f"❌ CRITICAL FAILURE: Could not write kill file: {e}")
+        sys.exit(1)
 
-
-# ==========================================================
 if __name__ == "__main__":
     main()
