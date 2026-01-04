@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import os  # Added for kill switch test
 from unittest.mock import MagicMock, AsyncMock, patch
 from httpx import HTTPStatusError, Request, Response
 import redis.asyncio as redis
@@ -299,7 +300,13 @@ async def test_chaos_websocket_disconnect(mock_dependencies):
     Scenario: WebSocket connection drops during trading.
     Expectation: System continues with fallback Greeks, logs warning.
     """
-    supervisor, _, _, _ = mock_dependencies
+    supervisor, market, _, _ = mock_dependencies
+    
+    # 1. Mock market to return VALID data even without WebSocket
+    market.get_live_quote.return_value = {
+        "NIFTY": 21500.0,  # Valid spot price
+        "VIX": 15.0
+    }
     
     # Create a mock WebSocket service
     mock_ws = MagicMock()
@@ -319,12 +326,14 @@ async def test_chaos_websocket_disconnect(mock_dependencies):
     assert "live_greeks" in snapshot, "Snapshot should contain live_greeks field"
     assert "ws_healthy" in snapshot, "Snapshot should contain ws_healthy field"
     assert snapshot["ws_healthy"] is False, "WebSocket should be marked as unhealthy"
+    assert snapshot["spot"] == 21500.0, f"Spot should be valid: {snapshot['spot']}"
     
     # 4. Verify data is still usable (spot price should be valid)
     valid, reason = supervisor.quality.validate_snapshot(snapshot)
     
     # Spot should be valid even without WebSocket
     assert valid is True, f"Data should be valid even without WebSocket. Reason: {reason}"
+    assert snapshot["spot"] > 0, f"Spot price should be positive: {snapshot['spot']}"
     
     print("✅ System handles WebSocket disconnection gracefully with fallback data.")
 
@@ -475,21 +484,28 @@ async def test_chaos_kill_switch(mock_dependencies):
     
     print("\n💥 Simulating Kill Switch Activation...")
     
-    # 1. Create temporary kill switch file
-    kill_switch_path = "KILL_SWITCH.TRIGGER"
-    
-    # Save original method to restore later
+    # 1. Mock os.path.exists for the kill switch
     original_exists = os.path.exists
     
+    kill_switch_detected = False
+    
+    def mock_exists(path):
+        if "KILL_SWITCH" in str(path).upper():
+            nonlocal kill_switch_detected
+            kill_switch_detected = True
+            return True
+        return original_exists(path)
+    
     try:
-        # Mock os.path.exists to return True for kill switch
-        os.path.exists = lambda path: True if path == kill_switch_path else original_exists(path)
+        # Apply the mock
+        os.path.exists = mock_exists
         
         # 2. Check kill switch
         should_stop = supervisor._check_kill_switch()
         
         # 3. Verify kill switch detection
         assert should_stop is True, "Kill switch should be detected"
+        assert kill_switch_detected is True, "Kill switch file should be checked"
         
         print("✅ Kill switch correctly detected")
         
