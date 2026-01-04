@@ -46,8 +46,6 @@ async def test_can_trade_new_insufficient_capital():
 async def test_can_trade_new_hedge_allowed():
     governor = CapitalGovernor(access_token="test", total_capital=1000000)
     governor.position_count = 10 
-    
-    # Complete leg dict required by predict_margin
     leg = {
         "action": "EXIT", 
         "strategy": "HEDGE",
@@ -55,19 +53,18 @@ async def test_can_trade_new_hedge_allowed():
         "quantity": 50,
         "side": "BUY"
     }
-    
     with patch.object(governor, 'predict_margin_requirement', return_value=0.0):
         with patch.object(governor, 'get_available_funds', return_value=100000.0):
              result = await governor.can_trade_new([leg])
-    
     assert result.allowed == True
 
 @pytest.mark.asyncio
-async def test_volatility_engine_calculation(mock_market_data):
+async def test_volatility_engine_calculation():
     engine = VolatilityEngine()
     
     dates = pd.date_range(end=pd.Timestamp.now(), periods=400)
-    # Volatility engine requires 'timestamp' column
+    
+    # Daily Data
     nh = pd.DataFrame({
         'close': np.random.randn(400) + 20000, 
         'high': 20100, 
@@ -75,7 +72,17 @@ async def test_volatility_engine_calculation(mock_market_data):
         'timestamp': dates
     })
     nh = nh.reset_index(drop=True)
-    vh = pd.DataFrame({'close': np.random.randn(400) + 12}, index=dates)
+    
+    # Intraday Data (FIX: Added timestamp column here)
+    vh = pd.DataFrame({
+        'close': np.random.randn(400) + 12,
+        'high': np.random.randn(400) + 13, # Added High/Low for Parkinson Vol
+        'low': np.random.randn(400) + 11,
+        'volume': 1000,
+        'oi': 5000,
+        'timestamp': dates 
+    })
+    vh = vh.reset_index(drop=True)
     
     result = await engine.calculate_volatility(nh, vh, 21500, 14.2)
     assert isinstance(result, VolMetrics)
