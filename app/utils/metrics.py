@@ -427,7 +427,15 @@ class MetricsCollector:
         active_positions.labels(strategy='all', instrument_type='all').set(cycle.positions_count)
     
     def update_portfolio_metrics(self, positions: list, pnl: float, margin: float):
-        """Update portfolio metrics"""
+        """Update portfolio metrics - ALIAS for backward compatibility"""
+        return self.update_portfolio_metrics_simple(
+            len(positions) if positions else 0,
+            pnl,
+            margin
+        )
+    
+    def update_portfolio_metrics_simple(self, positions_count: int, pnl: float, margin: float):
+        """Update portfolio metrics - new signature"""
         if not self._initialized:
             return
         
@@ -436,10 +444,7 @@ class MetricsCollector:
         daily_pnl.set(pnl)
         
         # Update position metrics
-        if positions:
-            position_pnl.labels(strategy='all', instrument_type='all').set(
-                sum(p.get('pnl', 0) for p in positions)
-            )
+        active_positions.labels(strategy='all', instrument_type='all').set(positions_count)
     
     def update_system_state(self, state: str, mode: str):
         """Update system state"""
@@ -606,6 +611,11 @@ def record_order_failed(failure_reason: str, phase: str = 'execution',
         instrument_type=instrument_type
     ).inc()
 
+def update_portfolio_metrics(positions: list, pnl: float, margin: float):
+    """Convenience function to update portfolio metrics - ALIAS for backward compatibility"""
+    positions_count = len(positions) if positions else 0
+    update_portfolio_metrics_simple(positions_count, pnl, margin)
+
 def update_portfolio_metrics_simple(positions_count: int, pnl: float, margin: float):
     """Simple portfolio metrics update"""
     active_positions.labels(strategy='all', instrument_type='all').set(positions_count)
@@ -636,5 +646,12 @@ def update_component_health_simple(component: str, healthy: bool):
     """Update component health"""
     component_health.labels(component=component).set(1 if healthy else 0)
 
+# ============================================
 # ALIASES FOR BACKWARD COMPATIBILITY
+# ============================================
+
+# Alias for supervisor_cycle_duration (used in supervisor.py)
 cycle_duration = supervisor_cycle_duration
+
+# Alias for the collector method
+collector.update_portfolio_metrics = collector.update_portfolio_metrics_simple
