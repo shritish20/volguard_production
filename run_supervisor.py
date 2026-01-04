@@ -24,7 +24,7 @@ from app.core.trading.adjustment_engine import AdjustmentEngine
 logger = setup_logging()
 
 async def shutdown(signal_name, loop, supervisor, resources):
-    """Graceful Shutdown Handler"""
+    """Graceful Shutdown Handler with Resource Cleanup"""
     logger.info(f"🛑 Received exit signal {signal_name.name}...")
     
     if supervisor:
@@ -39,12 +39,21 @@ async def shutdown(signal_name, loop, supervisor, resources):
     logger.info(f"Cancelling {len(tasks)} outstanding tasks")
     await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Close Resources (The most important part)
+    # Close Resources (Handle various close method names)
     logger.info("Closing Resources...")
     for name, res in resources.items():
         if res:
             try:
-                await res.close()
+                if hasattr(res, 'close'):
+                    if asyncio.iscoroutinefunction(res.close):
+                        await res.close()
+                    else:
+                        res.close()
+                elif hasattr(res, 'disconnect'):
+                    if asyncio.iscoroutinefunction(res.disconnect):
+                        await res.disconnect()
+                    else:
+                        res.disconnect()
                 logger.info(f"✅ {name} closed.")
             except Exception as e:
                 logger.error(f"❌ Failed to close {name}: {e}")
@@ -59,38 +68,38 @@ async def main():
     await init_db()
 
     # 2. Initialize Clients
-    # Note: We now use the config directly inside classes where possible, 
-    # but strictly pass tokens to ensure explicit dependency injection.
-    
     market_client = MarketDataClient(
         settings.UPSTOX_ACCESS_TOKEN,
         settings.UPSTOX_BASE_V2,
         settings.UPSTOX_BASE_V3
     )
     
+    # Initialize Executor (Now connects to Redis automatically)
     trade_executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
     
     websocket_service = None
     if settings.SUPERVISOR_WEBSOCKET_ENABLED:
-        # We need to resolve NIFTY/VIX keys first or pass empty list and subscribe later
-        # For simplicity, we initialize it, Supervisor connects it.
+        # Pass empty keys initially; Supervisor will subscribe dynamically
         websocket_service = MarketDataFeed(
             settings.UPSTOX_ACCESS_TOKEN, 
-            [] # Keys will be added by Supervisor logic if needed or pre-configured
+            [] 
         )
 
-    # 3. Initialize Engines
-    risk_engine = RiskEngine(settings.model_dump())
+    # 3. Initialize Engines (FIXED PARAMETERS)
+    # 🔴 FIX: RiskEngine expects a float, not a dict
+    risk_engine = RiskEngine(max_portfolio_loss=settings.MAX_PORTFOLIO_LOSS)
     
     cap_governor = CapitalGovernor(
-        settings.UPSTOX_ACCESS_TOKEN,
+        access_token=settings.UPSTOX_ACCESS_TOKEN,
         total_capital=settings.BASE_CAPITAL,
         max_daily_loss=settings.MAX_DAILY_LOSS,
         max_positions=settings.MAX_POSITIONS
     )
     
+    # Trading Engine gets the full config dump for strategy parameters
     trading_engine = TradingEngine(market_client, settings.model_dump())
-    adj_engine = AdjustmentEngine(delta_threshold=15.0) # Configurable
+    
+    adj_engine = AdjustmentEngine(delta_threshold=15.0) 
 
     # 4. Boot Supervisor
     supervisor = ProductionTradingSupervisor(
@@ -104,7 +113,7 @@ async def main():
         loop_interval_seconds=settings.SUPERVISOR_LOOP_INTERVAL
     )
 
-    # 5. Set Execution Mode
+    # 5. Set Execution Mode based on Config
     if settings.ENVIRONMENT == "production_live":
         logger.warning("!!! ⚠️ RUNNING IN FULL_AUTO MODE - REAL TRADING ENABLED !!!")
         supervisor.safety.execution_mode = ExecutionMode.FULL_AUTO
@@ -119,8 +128,8 @@ async def main():
     loop = asyncio.get_running_loop()
     resources = {
         "MarketClient": market_client,
-        "TradeExecutor": trade_executor, # Now holds Redis connection
-        "CapitalGovernor": cap_governor
+        "WebsocketService": websocket_service,
+        # "TradeExecutor": trade_executor # Executor relies on Redis, handled by container
     }
     
     for signame in {'SIGINT', 'SIGTERM'}:
