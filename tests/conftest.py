@@ -17,7 +17,6 @@ def event_loop():
 def mock_redis():
     """Mock Redis for Idempotency Checks"""
     mock = AsyncMock()
-    # Simulate 'SET NX' (Locking) returning True (Success)
     mock.set.return_value = True
     mock.get.return_value = None
     return mock
@@ -25,7 +24,6 @@ def mock_redis():
 @pytest.fixture
 def mock_market_client():
     client = AsyncMock()
-    # Default valid quote response
     client.get_live_quote.return_value = {
         "NSE_INDEX|Nifty 50": 21500.0,
         "NSE_INDEX|India VIX": 14.5
@@ -36,21 +34,17 @@ def mock_market_client():
 @pytest.fixture
 def mock_executor():
     exc = AsyncMock()
-    # Simulate a successful order verification
     exc.verify_order_status.return_value = {
         "status": "complete", 
-        "filled_quantity": 50,
+        "filled_quantity": 50, 
         "average_price": 100.0,
         "verified": True
     }
-    # Simulate successful execution
     exc.execute_adjustment.return_value = {
         "status": "PLACED",
         "order_id": "test_order_123"
     }
     return exc
-
-# --- MISSING FIXTURES RESTORED BELOW ---
 
 @pytest.fixture
 def mock_supervisor_dependencies(mock_market_client, mock_executor):
@@ -66,7 +60,7 @@ def mock_supervisor_dependencies(mock_market_client, mock_executor):
 
 @pytest.fixture
 def mock_option_chain():
-    """Returns a simplified DataFrame-like structure for Logic Tests"""
+    """Returns a DataFrame with ALL required columns (Fixed KeyError)"""
     return pd.DataFrame({
         'strike': [21400, 21500, 21600],
         'ce_iv': [15.0, 14.5, 14.0],
@@ -78,12 +72,13 @@ def mock_option_chain():
         'ce_theta': [-10, -12, -10],
         'pe_theta': [-10, -12, -10],
         'ce_vega': [5, 6, 5],
-        'pe_vega': [5, 6, 5]
+        'pe_vega': [5, 6, 5],
+        'ce_oi': [100000, 200000, 150000],  # ADDED
+        'pe_oi': [150000, 200000, 100000]   # ADDED
     })
 
 @pytest.fixture
 def mock_position():
-    """Returns a valid position dictionary"""
     return {
         "symbol": "NIFTY21500CE",
         "quantity": 50,
@@ -96,5 +91,4 @@ def mock_position():
 
 @pytest.fixture
 def test_settings():
-    """Returns the settings object"""
     return settings
