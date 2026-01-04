@@ -11,7 +11,7 @@ class Environment(str, Enum):
     # Added these to match .env and run_supervisor.py logic
     SEMI_AUTO = "production_semi"
     FULL_AUTO = "production_live"
-
+    TEST = "test"
 class Settings(BaseSettings):
     # ==== Project Info ====
     PROJECT_NAME: str = "VolGuard Algorithmic Trading"
@@ -117,3 +117,4 @@ class Settings(BaseSettings):
                 raise RuntimeError("ADMIN_SECRET must be set in production modes")
 
 settings = Settings()
+
