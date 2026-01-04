@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 from app.core.market.data_client import MarketDataClient
 
 @pytest.fixture
@@ -10,14 +10,13 @@ def client():
         mock_cls.return_value = mock_instance
         
         client = MarketDataClient(access_token="test_token")
-        # Ensure the client property is the mock instance
         client.client = mock_instance
         return client
 
 @pytest.mark.asyncio
 async def test_get_live_quote_success(client):
     """Test normal data fetch"""
-    mock_response = {
+    mock_data = {
         "status": "success",
         "data": {
             "NSE_INDEX|Nifty 50": {"last_price": 21500.0},
@@ -25,37 +24,35 @@ async def test_get_live_quote_success(client):
         }
     }
     
-    # Mock the response object
-    mock_resp_obj = AsyncMock()
-    mock_resp_obj.status_code = 200
-    mock_resp_obj.json.return_value = mock_response
+    # 1. Create a response object that has a .json() method
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = mock_data
     
-    # Assign to client.get
-    client.client.get.return_value = mock_resp_obj
+    # 2. Setup the async get call to return this response
+    # When (await client.get()) happens, it returns mock_response
+    client.client.get.return_value = mock_response
 
+    # Execute
     data = await client.get_live_quote(["NSE_INDEX|Nifty 50"])
     
-    # Adjust assertion based on your actual return structure
-    # (Checking if it returns a dict with values)
+    # Assert
     assert isinstance(data, dict)
-    assert "NSE_INDEX|Nifty 50" in str(data) or 21500.0 in data.values()
+    # Check if data was extracted correctly (ignoring exact key format for resilience)
+    assert any("21500" in str(v) or v == 21500.0 for v in data.values())
 
 @pytest.mark.asyncio
 async def test_api_unauthorized_401(client):
     """Test token expiry handling"""
-    mock_resp_obj = AsyncMock()
-    mock_resp_obj.status_code = 401
-    mock_resp_obj.raise_for_status.side_effect = Exception("401 Unauthorized")
+    mock_response = MagicMock()
+    mock_response.status_code = 401
+    mock_response.raise_for_status.side_effect = Exception("401 Unauthorized")
     
-    client.client.get.return_value = mock_resp_obj
+    client.client.get.return_value = mock_response
 
-    # Should handle exception gracefully (log and return empty/None)
-    try:
-        result = await client.get_live_quote(["TEST"])
-        assert result == {} or result is None
-    except Exception:
-        # If your code re-raises, that's also valid for this test
-        pass
+    # Expect gracefull handling (return empty dict or None, no crash)
+    result = await client.get_live_quote(["TEST"])
+    assert result == {} or result is None
 
 @pytest.mark.asyncio
 async def test_instrument_lookup(client):
