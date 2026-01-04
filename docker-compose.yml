@@ -1,12 +1,17 @@
 version: '3.8'
 
 services:
+  # ----------------------------------------------------------------
+  # 1. DATABASE (Postgres 15)
+  # ----------------------------------------------------------------
   postgres:
     image: postgres:15-alpine
+    container_name: volguard_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      TZ: Asia/Kolkata
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -16,50 +21,77 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: always
 
+  # ----------------------------------------------------------------
+  # 2. CACHE & STATE (Redis 7) - CRITICAL FOR EXECUTOR
+  # ----------------------------------------------------------------
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    container_name: volguard_redis
+    command: redis-server --appendonly yes  # Enable disk persistence
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
 
+  # ----------------------------------------------------------------
+  # 3. TRADING SUPERVISOR (The Brain)
+  # ----------------------------------------------------------------
   supervisor:
     build: .
+    container_name: volguard_supervisor
     environment:
       - POSTGRES_SERVER=postgres
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - REDIS_URL=redis://redis:6379
-      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
+      - REDIS_URL=redis://redis:6379/0
+      - TZ=Asia/Kolkata
+      # Pass all other env vars automatically
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB
+      - UPSTOX_ACCESS_TOKEN
+      - ENVIRONMENT
+      - BASE_CAPITAL
+      - MAX_DAILY_LOSS
+      - SUPERVISOR_LOOP_INTERVAL
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
-      - ./logs:/app/logs
-      - ./journal:/app/journal
-    command: python run_production.py
+      - ./logs:/app/logs        # Persist logs
+      - ./journal:/app/journal  # Persist decision journals
+    # Use the restart-proof runner
+    command: python run_supervisor.py
+    restart: always
 
+  # ----------------------------------------------------------------
+  # 4. API DASHBOARD (The Interface)
+  # ----------------------------------------------------------------
   api:
     build: .
+    container_name: volguard_api
     ports:
       - "8000:8000"
     environment:
       - POSTGRES_SERVER=postgres
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - REDIS_URL=redis://redis:6379
-      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
+      - REDIS_URL=redis://redis:6379/0
+      - TZ=Asia/Kolkata
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB
     depends_on:
       - postgres
       - redis
-    # FIXED: Added proper spaces and dashes
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: always
 
 volumes:
   postgres_data:
