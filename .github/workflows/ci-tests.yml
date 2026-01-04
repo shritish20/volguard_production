@@ -1,0 +1,71 @@
+name: Risk Engine CI
+
+# Trigger on push or pull request to main branch
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test_suite:
+    name: Run Full Test Suite
+    runs-on: ubuntu-latest
+
+    # Service containers (Mocking Redis/DB is fine, but good to have env ready)
+    services:
+      redis:
+        image: redis:alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # 1. Check out your code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Set up Python 3.11 (Modern Async Support)
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip' # Cache dependencies for speed
+
+      # 3. Install Dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install testing tools
+          pip install pytest pytest-asyncio pytest-mock httpx
+          # Install core libraries used in your code
+          pip install pandas numpy scipy fast_arrow redis pydantic fastapi uvicorn python-dotenv requests
+          
+          # If you have a requirements.txt, use it (Optional fallback)
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # 4. Create Directory Structure for Tests (Safety Check)
+      - name: Ensure State Directories Exist
+        run: |
+          mkdir -p state
+          mkdir -p logs
+
+      # 5. Run the Tests
+      - name: Run Pytest
+        env:
+          # Add current directory to python path so 'from app...' works
+          PYTHONPATH: ${{ github.workspace }}
+          # Force Safe Environment for CI
+          ENVIRONMENT: SHADOW
+          # Mock Secrets (Tests shouldn't need real keys)
+          UPSTOX_API_KEY: "test_key"
+          UPSTOX_API_SECRET: "test_secret"
+          REDIS_URL: "redis://localhost:6379/0"
+        run: |
+          # -v: Verbose output
+          # --asyncio-mode=auto: Handle async tests automatically
+          pytest tests/ -v --asyncio-mode=auto
