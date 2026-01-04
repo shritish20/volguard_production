@@ -1,5 +1,3 @@
-# app/lifecycle/supervisor.py
-
 import asyncio
 import time
 import logging
@@ -32,12 +30,18 @@ from app.core.risk.engine import RiskEngine
 from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
 from app.schemas.analytics import ExtMetrics, VolMetrics, RegimeResult
 
+# Metrics Import
+from app.utils.metrics import (
+    track_duration, cycle_duration, update_portfolio_metrics,
+    set_system_state, net_delta as net_delta_metric, data_quality_score
+)
+
 logger = logging.getLogger(__name__)
 
 class ProductionTradingSupervisor:
-    """
+    """ 
     VolGuard Smart Supervisor (VolGuard 3.0) - PRODUCTION HARDENED
-    
+
     Upgrades:
     - Drift-Correcting Loop: Uses monotonic clock to stay perfectly on 3s grid.
     - Boot Reconciliation: Forces Executor to sync DB vs Broker before starting.
@@ -56,6 +60,7 @@ class ProductionTradingSupervisor:
         websocket_service=None,
         loop_interval_seconds: float = 3.0,
     ):
+
         # Clients
         self.market = market_client
         self.risk = risk_engine
@@ -74,7 +79,7 @@ class ProductionTradingSupervisor:
         self.exit_engine = ExitEngine()
         self.regime_engine = RegimeEngine()
         self.structure_engine = StructureEngine()
-        self.vol_engine = VolatilityEngine() 
+        self.vol_engine = VolatilityEngine()
         self.edge_engine = EdgeEngine()
 
         # Loop Control
@@ -90,18 +95,18 @@ class ProductionTradingSupervisor:
         self.last_daily_fetch = 0.0
         self.last_intraday_fetch = 0.0
         self.last_entry_time = 0.0
-        
+
         # Config
         self.min_entry_interval = 300  # 5 mins between new entries
         self.intraday_fetch_interval = 300  # 5 mins
-        
+
         # Regime Stability
         self.regime_history = deque(maxlen=5)
         self.regime_last_change = time.time()
 
     async def start(self):
         """Main Entry Point - The Boot Sequence"""
-        logger.info(f"🚀 Supervisor booting in {self.safety.execution_mode.value} mode")
+        logger.info(f"Supervisor booting in {self.safety.execution_mode.value} mode")
 
         # 1. MASTER CLOCK CHECK (Holidays)
         await self._check_market_status()
@@ -116,30 +121,35 @@ class ProductionTradingSupervisor:
         logger.info("🔧 Reconciling Broker State with Database...")
         try:
             await self.exec.reconcile_state()
+            logger.info("✅ State reconciliation complete")
         except Exception as e:
-            # If reconciliation fails, we usually shouldn't start, but in semi-auto we might warn.
-            logger.critical(f"FATAL: Reconciliation Failed: {e}")
-            if self.safety.execution_mode == ExecutionMode.FULL_AUTO:
-                raise e # Stop startup
+            logger.critical(f"❌ FATAL: Reconciliation Failed: {e}")
+            # FIXED: Always require reconciliation, regardless of mode
+            if self.safety.execution_mode in [ExecutionMode.FULL_AUTO, ExecutionMode.SEMI_AUTO]:
+                logger.critical("Cannot start supervisor with unreconciled state in trading mode")
+                raise e
+            else:
+                # In SHADOW mode, warn but allow startup
+                logger.warning("⚠️  Starting in SHADOW mode with reconciliation failure")
+                logger.warning("Risk calculations may be inaccurate!")
 
         # 5. CONNECT WEBSOCKET
         if self.ws:
             await self.ws.connect()
 
         self.running = True
-        
-        # Start the Drift-Correcting Loop
         await self._run_loop()
 
     async def _run_loop(self):
         """
         The Heartbeat. Uses Monotonic Time to prevent drift.
+        NOW WITH METRICS EXPORT.
         """
-        # Align next tick to the grid
         next_tick = time.monotonic()
-        
+
         while self.running:
-            cycle_start = time.time() # Wall clock for logs
+            cycle_start_wall = time.time()
+            cycle_start_mono = time.monotonic()
             cycle_id = str(uuid.uuid4())[:8]
             cycle_log = {"cycle_id": cycle_id, "mode": self.safety.execution_mode.value}
 
@@ -148,101 +158,160 @@ class ProductionTradingSupervisor:
                 break
 
             try:
-                # ==========================================
-                # PHASE 1: SMART DATA REFRESH
-                # ==========================================
-                if time.time() - self.last_intraday_fetch > self.intraday_fetch_interval:
-                    asyncio.create_task(self._refresh_intraday_data())
+                # === METRICS: Track cycle duration ===
+                with cycle_duration.time():
 
-                snapshot = await self._read_live_snapshot()
-                
-                valid, reason = self.quality.validate_snapshot(snapshot)
-                if not valid:
-                    logger.warning(f"[{cycle_id}] Data Invalid: {reason}")
-                    await self.safety.record_failure("DATA_QUALITY", {"reason": reason})
-                    cycle_log["error"] = reason
-                    # Don't trade, just wait for next tick
-                    await self._sleep_until(next_tick + self.interval)
-                    next_tick += self.interval
-                    continue
+                    # PHASE 1: SMART DATA REFRESH
+                    if time.time() - self.last_intraday_fetch > self.intraday_fetch_interval:
+                        asyncio.create_task(self._refresh_intraday_data())
 
-                await self.safety.record_success()
+                    snapshot = await self._read_live_snapshot()
+                    valid, reason = self.quality.validate_snapshot(snapshot)
 
-                # ==========================================
-                # PHASE 2: POSITIONS & FUNDS
-                # ==========================================
-                self.positions = await self._update_positions(snapshot)
-                asyncio.create_task(self._update_capital_state())
+                    if not valid:
+                        logger.warning(f"[{cycle_id}] Data Invalid: {reason}")
+                        await self.safety.record_failure("DATA_QUALITY", {"reason": reason})
+                        cycle_log["error"] = reason
 
-                # ==========================================
-                # PHASE 3: RISK SCAN (Stress Test)
-                # ==========================================
-                risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions)
-                worst_case = risk_report.get("WORST_CASE", {}).get("impact", 0.0)
-                
-                stress_block = False
-                if snapshot["spot"] > 0 and worst_case < -0.03 * snapshot["spot"]:
-                    stress_block = True
-                    logger.warning(f"[{cycle_id}] STRESS BLOCK ACTIVE (Worst: {worst_case:.2f})")
+                        # === METRICS: Update data quality ===
+                        data_quality_score.set(0.0)
 
-                # ==========================================
-                # PHASE 4: DECISION ENGINE
-                # ==========================================
-                adjustments = []
+                        await self._sleep_until(next_tick + self.interval)
+                        next_tick += self.interval
+                        continue
 
-                # A. Exits (Always allowed)
-                exits = await self.exit_engine.evaluate_exits(list(self.positions.values()), snapshot)
-                adjustments.extend(exits)
+                    await self.safety.record_success()
 
-                # B. Hedges & Entries
-                if not exits:
-                    # Hedges
-                    net_delta = self._calc_net_delta()
-                    hedges = await self.adj.evaluate_portfolio(
-                        {"aggregate_metrics": {"delta": net_delta}}, 
-                        snapshot
-                    )
-                    adjustments.extend(hedges)
+                    # === METRICS: Update data quality ===
+                    data_quality_score.set(1.0)
 
-                    # Entries (Only if stable and safe)
-                    can_enter_soft = (
-                        not self.positions and 
-                        not hedges and 
-                        not stress_block and 
-                        (time.time() - self.last_entry_time > self.min_entry_interval)
+                    # PHASE 2: POSITIONS & FUNDS
+                    self.positions = await self._update_positions(snapshot)
+                    funds = await self.cap_governor.get_available_funds()
+
+                    # === METRICS: Update portfolio metrics ===
+                    update_portfolio_metrics(
+                        list(self.positions.values()),
+                        self.cap_governor.daily_pnl,
+                        funds
                     )
 
-                    if can_enter_soft:
-                        adjustments.extend(await self._run_entry_logic(snapshot))
+                    # Calculate and export net delta
+                    portfolio_delta = self._calc_net_delta()
+                    net_delta_metric.set(portfolio_delta)
 
-                # ==========================================
-                # PHASE 5: EXECUTION
-                # ==========================================
-                for adj in adjustments:
-                    await self._process_adjustment(adj, snapshot, cycle_id)
+                    asyncio.create_task(self._update_capital_state())
+
+                    # PHASE 3: RISK SCAN
+                    risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions)
+                    worst_case = risk_report.get("WORST_CASE", {}).get("impact", 0.0)
+                    stress_block = False
+
+                    if snapshot["spot"] > 0 and worst_case < -0.03 * snapshot["spot"]:
+                        stress_block = True
+                        logger.warning(f"[{cycle_id}] STRESS BLOCK ACTIVE (Worst: {worst_case:.2f})")
+
+                    # PHASE 4: DECISION ENGINE
+                    adjustments = []
+
+                    # A. Exits (Always allowed)
+                    exits = await self.exit_engine.evaluate_exits(list(self.positions.values()), snapshot)
+                    adjustments.extend(exits)
+
+                    # B. Hedges & Entries
+                    if not exits:
+                        # Hedges
+                        hedges = await self.adj.evaluate_portfolio(
+                            {"aggregate_metrics": {"delta": portfolio_delta}},
+                            snapshot
+                        )
+                        adjustments.extend(hedges)
+
+                        # Entries
+                        can_enter_soft = (
+                            not self.positions and
+                            not hedges and
+                            not stress_block and
+                            (time.time() - self.last_entry_time > self.min_entry_interval)
+                        )
+
+                        if can_enter_soft:
+                            adjustments.extend(await self._run_entry_logic(snapshot))
+
+                    # PHASE 5: EXECUTION
+                    for adj in adjustments:
+                        await self._process_adjustment(adj, snapshot, cycle_id)
+
+                    # === METRICS: Export system state ===
+                    set_system_state(self.safety.system_state.name)
+
+                    # === LOG: Cycle summary ===
+                    cycle_duration_ms = (time.time() - cycle_start_wall) * 1000
+                    logger.info(
+                        f"[{cycle_id}] Cycle complete in {cycle_duration_ms:.1f}ms | "
+                        f"Positions: {len(self.positions)} | Delta: {portfolio_delta:.2f} | "
+                        f"Adjustments: {len(adjustments)}"
+                    )
 
             except Exception as e:
                 logger.exception(f"[{cycle_id}] Supervisor Cycle Crash")
                 cycle_log["exception"] = str(e)
-            
+
             finally:
                 # Log decision asynchronously
                 asyncio.create_task(add_decision_log(cycle_log))
-                
+
                 # DRIFT CORRECTION SLEEP
                 next_tick += self.interval
                 await self._sleep_until(next_tick)
 
-    # ==================================================================
-    # LOGIC HELPERS
-    # ==================================================================
+    async def _read_live_snapshot(self) -> Dict:
+        """
+        Reads live market data with validation.
+        NOW WITH WEBSOCKET GREEK VALIDATION.
+        """
+        quotes = await self.market.get_live_quote([NIFTY_KEY, VIX_KEY])
+
+        # WebSocket Greeks with validation
+        greeks = {}
+        if self.ws and self.ws.is_healthy():
+            raw_greeks = self.ws.get_latest_greeks()
+
+            # CRITICAL FIX: Validate Greek data before using
+            for key, greek_data in raw_greeks.items():
+                if not greek_data:
+                    continue
+
+                # Validate delta is in valid range
+                delta = greek_data.get('delta', 0)
+                if not isinstance(delta, (int, float)) or abs(delta) > 1.0:
+                    logger.warning(f"Invalid delta from WS for {key}: {delta}")
+                    continue
+
+                # Validate gamma is positive
+                gamma = greek_data.get('gamma', 0)
+                if not isinstance(gamma, (int, float)) or gamma < 0:
+                    logger.warning(f"Invalid gamma from WS for {key}: {gamma}")
+                    continue
+
+                # Only include if validation passed
+                greeks[key] = greek_data
+
+            if raw_greeks and not greeks:
+                logger.error("All WebSocket Greeks failed validation - discarding")
+
+        return {
+            "spot": quotes.get(NIFTY_KEY, 0.0),
+            "vix": quotes.get(VIX_KEY, 0.0),
+            "live_greeks": greeks,
+            "timestamp": datetime.now()
+        }
 
     async def _run_entry_logic(self, snapshot):
         """Separated Entry Logic for cleanliness"""
         expiry, chain = await self.engine._get_best_expiry_chain()
         if not expiry or chain.empty:
             return []
-
         # 1. Hybrid Volatility
         vol = await self.vol_engine.calculate_volatility(
             self.daily_data, self.intraday_data, snapshot["spot"], snapshot["vix"]
@@ -251,9 +320,9 @@ class ProductionTradingSupervisor:
         # 2. Structure & Edge
         st = self.structure_engine.analyze_structure(chain, snapshot["spot"], 50)
         ed = self.edge_engine.detect_edges(chain, chain, snapshot["spot"], vol)
-        
+
         # 3. Regime
-        ext = ExtMetrics(0, 0, 0, [], False) 
+        ext = ExtMetrics(0, 0, 0, [], False)
         regime = self.regime_engine.calculate_regime(vol, st, ed, ext)
 
         if self._is_regime_stable(regime.name):
@@ -264,10 +333,10 @@ class ProductionTradingSupervisor:
         return []
 
     async def _process_adjustment(self, adj, snapshot, cycle_id):
-        """
+        """  
         Handles Safety, Capital Check, and Execution.
         NOW WRAPPED IN TRY/EXCEPT FOR DEFENSE IN DEPTH.
-        """
+        """  
         adj["cycle_id"] = cycle_id
 
         try:
@@ -276,7 +345,7 @@ class ProductionTradingSupervisor:
             if not safe["allowed"]:
                 return
 
-            # 2. Capital Check (Skip for exits/hedges to ensure safety?)
+            # 2. Capital Check
             if adj.get("action") == "ENTRY":
                 margin_res = await self.cap_governor.can_trade_new([adj])
                 if not margin_res.allowed:
@@ -290,12 +359,9 @@ class ProductionTradingSupervisor:
             elif mode == ExecutionMode.SEMI_AUTO:
                 await self.approvals.request_approval(adj, snapshot)
             elif mode == ExecutionMode.FULL_AUTO:
-                # Inject Cycle ID for Idempotency
-                adj["cycle_id"] = cycle_id 
-                
-                # CRITICAL: This await can explode if Executor is mocked to fail
+                adj["cycle_id"] = cycle_id
                 result = await self.exec.execute_adjustment(adj)
-                
+
                 if result.get("status") == "PLACED":
                     logger.info(f"[{cycle_id}] Order Placed: {result.get('order_id')}")
                 else:
@@ -303,7 +369,6 @@ class ProductionTradingSupervisor:
                     await self.safety.record_failure("EXECUTION_ERROR", result)
 
         except Exception as e:
-            # This is what catches the 'Redis Death' simulation in the test
             logger.critical(f"[{cycle_id}] CRITICAL EXECUTION CRASH: {e}")
             await self.safety.record_failure("EXECUTION_CRASH", {"error": str(e)})
 
@@ -315,11 +380,6 @@ class ProductionTradingSupervisor:
         else:
             await asyncio.sleep(0)
 
-    # ... [Assuming original helper methods remain unchanged below] ...
-    # _check_market_status, _refresh_heavy_data, _refresh_intraday_data, 
-    # _read_live_snapshot, _update_capital_state, _update_positions, 
-    # _check_kill_switch, _is_regime_stable, _calculate_time_to_expiry, _calc_net_delta
-    
     async def _check_market_status(self):
         logger.info("Checking Market Status (Holidays)...")
         holidays = await self.market.get_holidays()
@@ -330,7 +390,7 @@ class ProductionTradingSupervisor:
             if telegram_alerts.enabled:
                 await telegram_alerts.send_alert("Market Status", msg, "INFO")
             exit(0)
-        
+
         now = datetime.now().time()
         market_open = datetime.strptime("09:15", "%H:%M").time()
         market_close = datetime.strptime("15:30", "%H:%M").time()
@@ -349,18 +409,6 @@ class ProductionTradingSupervisor:
             self.last_intraday_fetch = time.time()
         except Exception as e:
             logger.error(f"Background Intraday Refresh Failed: {e}")
-
-    async def _read_live_snapshot(self) -> Dict:
-        quotes = await self.market.get_live_quote([NIFTY_KEY, VIX_KEY])
-        greeks = {}
-        if self.ws and self.ws.is_healthy():
-            greeks = self.ws.get_latest_greeks()
-        return {
-            "spot": quotes.get(NIFTY_KEY, 0.0),
-            "vix": quotes.get(VIX_KEY, 0.0),
-            "live_greeks": greeks,
-            "timestamp": datetime.now()
-        }
 
     async def _update_capital_state(self):
         funds = await self.cap_governor.get_available_funds()
@@ -397,7 +445,8 @@ class ProductionTradingSupervisor:
 
     def _calculate_time_to_expiry(self, expiry: Union[str, datetime, None]) -> float:
         try:
-            if not expiry: return 0.05
+            if not expiry:
+                return 0.05
             if isinstance(expiry, str):
                 expiry = datetime.strptime(expiry, "%Y-%m-%d")
             return max((expiry - datetime.now()).total_seconds() / (365 * 24 * 3600), 0.001)
@@ -410,6 +459,7 @@ class ProductionTradingSupervisor:
             qty = p.get("quantity", 0)
             side = 1 if p.get("side") == "BUY" else -1
             delta = p.get("greeks", {}).get("delta", 0)
-            if "FUT" in str(p.get("symbol", "")): delta = 1.0
-            total += delta * qty * side 
+            if "FUT" in str(p.get("symbol", "")):
+                delta = 1.0
+            total += delta * qty * side
         return total
