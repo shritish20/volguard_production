@@ -1,12 +1,11 @@
 # app/schemas/trade.py
 
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Literal
 from datetime import datetime
 
-
 # ======================================================
-# BASE TRADE MODEL
+# BASE TRADE MODEL (Shared Fields)
 # ======================================================
 class TradeBase(BaseModel):
     instrument_key: str
@@ -35,16 +34,14 @@ class TradeBase(BaseModel):
     # Reason / audit
     reason: Optional[str] = None
 
-
 # ======================================================
-# TRADE CREATE (ENGINE → DB)
+# TRADE CREATE (Engine -> DB)
 # ======================================================
 class TradeCreate(TradeBase):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-
 # ======================================================
-# TRADE RESPONSE (DB → API)
+# TRADE RESPONSE (DB -> API)
 # ======================================================
 class TradeResponse(TradeBase):
     id: str
@@ -56,9 +53,8 @@ class TradeResponse(TradeBase):
     class Config:
         from_attributes = True
 
-
 # ======================================================
-# TRADE UPDATE (EXIT / STATUS CHANGE)
+# TRADE UPDATE (Exit / Status Change)
 # ======================================================
 class TradeUpdate(BaseModel):
     status: Optional[Literal["OPEN", "CLOSED", "REJECTED"]] = None
