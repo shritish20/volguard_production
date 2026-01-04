@@ -14,6 +14,7 @@ from app.core.risk.engine import RiskEngine
 from app.core.data.quality_gate import DataQualityGate
 from app.schemas.analytics import VolMetrics, StructMetrics, EdgeMetrics, ExtMetrics
 
+# --- SAFETY CONTROLLER TESTS ---
 @pytest.mark.asyncio
 async def test_safety_controller_initial_state():
     controller = SafetyController()
@@ -34,6 +35,7 @@ async def test_record_failure_escalation():
         await controller.record_failure("API_ERROR", {"attempt": i})
     assert controller.system_state == SystemState.HALTED
 
+# --- CAPITAL GOVERNOR TESTS ---
 @pytest.mark.asyncio
 async def test_can_trade_new_insufficient_capital():
     governor = CapitalGovernor(access_token="test", total_capital=1000000)
@@ -46,6 +48,7 @@ async def test_can_trade_new_insufficient_capital():
 async def test_can_trade_new_hedge_allowed():
     governor = CapitalGovernor(access_token="test", total_capital=1000000)
     governor.position_count = 10 
+    
     leg = {
         "action": "EXIT", 
         "strategy": "HEDGE",
@@ -53,31 +56,38 @@ async def test_can_trade_new_hedge_allowed():
         "quantity": 50,
         "side": "BUY"
     }
+    
     with patch.object(governor, 'predict_margin_requirement', return_value=0.0):
         with patch.object(governor, 'get_available_funds', return_value=100000.0):
              result = await governor.can_trade_new([leg])
+    
     assert result.allowed == True
 
+# --- ANALYTICS TESTS ---
 @pytest.mark.asyncio
 async def test_volatility_engine_calculation():
     engine = VolatilityEngine()
     
     dates = pd.date_range(end=pd.Timestamp.now(), periods=400)
     
-    # Daily Data
+    # FIX 1: Ensure Daily Data has all OHLCV columns + Timestamp
     nh = pd.DataFrame({
-        'close': np.random.randn(400) + 20000, 
+        'open': np.random.randn(400) + 20000,   # Added
         'high': 20100, 
         'low': 19900,
+        'close': np.random.randn(400) + 20000, 
+        'volume': 10000,                        # Added
+        'oi': 50000,                            # Added
         'timestamp': dates
     })
     nh = nh.reset_index(drop=True)
     
-    # Intraday Data (FIX: Added timestamp column here)
+    # FIX 2: Ensure Intraday Data has all OHLCV columns + Timestamp
     vh = pd.DataFrame({
-        'close': np.random.randn(400) + 12,
-        'high': np.random.randn(400) + 13, # Added High/Low for Parkinson Vol
+        'open': np.random.randn(400) + 12,      # <--- THIS WAS THE MISSING KEY
+        'high': np.random.randn(400) + 13,
         'low': np.random.randn(400) + 11,
+        'close': np.random.randn(400) + 12,
         'volume': 1000,
         'oi': 5000,
         'timestamp': dates 
@@ -104,6 +114,7 @@ def test_regime_engine_calculation():
     result = engine.calculate_regime(vol, st, ed, ex)
     assert result.name in ["AGGRESSIVE_SHORT", "MODERATE_SHORT", "LONG_VOL", "NEUTRAL", "CASH"]
 
+# --- ADJUSTMENT ENGINE TESTS ---
 @pytest.mark.asyncio
 async def test_evaluate_portfolio_delta_breach(test_settings):
     config = test_settings.model_dump()
@@ -117,6 +128,7 @@ async def test_evaluate_portfolio_delta_breach(test_settings):
     assert adjs[0]["action"] == "ENTRY"
     assert adjs[0]["strategy"] == "DELTA_HEDGE"
 
+# --- RISK ENGINE TESTS ---
 @pytest.mark.asyncio
 async def test_stress_test_calculation(mock_position):
     engine = RiskEngine()
@@ -127,6 +139,7 @@ async def test_stress_test_calculation(mock_position):
     assert "WORST_CASE" in result
     assert len(result["matrix"]) == 15
 
+# --- DATA QUALITY TESTS ---
 def test_validate_snapshot_valid():
     gate = DataQualityGate()
     is_valid, reason = gate.validate_snapshot({"spot": 21500.50, "vix": 14.2})
