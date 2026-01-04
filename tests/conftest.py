@@ -1,38 +1,100 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
+import pandas as pd
 from app.config import settings
 
-# 1. Shared Event Loop
+# --- SCOPE: SESSION ---
 @pytest.fixture(scope="session")
 def event_loop():
+    """Create an instance of the default event loop for each test case."""
     loop = asyncio.get_event_loop_policy().new_event_loop()
     yield loop
     loop.close()
 
-# 2. Mock Redis (Critical for Idempotency)
+# --- MOCKS ---
 @pytest.fixture
 def mock_redis():
-    redis = AsyncMock()
-    redis.set.return_value = True  # Lock acquired
-    redis.get.return_value = None
-    return redis
+    """Mock Redis for Idempotency Checks"""
+    mock = AsyncMock()
+    # Simulate 'SET NX' (Locking) returning True (Success)
+    mock.set.return_value = True
+    mock.get.return_value = None
+    return mock
 
-# 3. Mock Upstox Client (Critical for Market Data)
 @pytest.fixture
 def mock_market_client():
     client = AsyncMock()
-    # Default valid response
+    # Default valid quote response
     client.get_live_quote.return_value = {
         "NSE_INDEX|Nifty 50": 21500.0,
         "NSE_INDEX|India VIX": 14.5
     }
-    client.get_option_chain.return_value = [] # Return empty list or valid DF structure
+    client.get_option_chain.return_value = []
     return client
 
-# 4. Mock Executor (Critical for Trading)
 @pytest.fixture
 def mock_executor():
     exc = AsyncMock()
-    exc.verify_order_status.return_value = {"status": "complete", "filled_qty": 50}
+    # Simulate a successful order verification
+    exc.verify_order_status.return_value = {
+        "status": "complete", 
+        "filled_quantity": 50,
+        "average_price": 100.0,
+        "verified": True
+    }
+    # Simulate successful execution
+    exc.execute_adjustment.return_value = {
+        "status": "PLACED",
+        "order_id": "test_order_123"
+    }
     return exc
+
+# --- MISSING FIXTURES RESTORED BELOW ---
+
+@pytest.fixture
+def mock_supervisor_dependencies(mock_market_client, mock_executor):
+    """Bundles all dependencies for Supervisor instantiation"""
+    return {
+        "market": mock_market_client,
+        "risk": AsyncMock(),
+        "adj": AsyncMock(),
+        "executor": mock_executor,
+        "engine": AsyncMock(),
+        "ws": AsyncMock()
+    }
+
+@pytest.fixture
+def mock_option_chain():
+    """Returns a simplified DataFrame-like structure for Logic Tests"""
+    return pd.DataFrame({
+        'strike': [21400, 21500, 21600],
+        'ce_iv': [15.0, 14.5, 14.0],
+        'pe_iv': [16.0, 15.5, 15.0],
+        'ce_delta': [0.6, 0.5, 0.4],
+        'pe_delta': [-0.4, -0.5, -0.6],
+        'ce_gamma': [0.001, 0.002, 0.001],
+        'pe_gamma': [0.001, 0.002, 0.001],
+        'ce_theta': [-10, -12, -10],
+        'pe_theta': [-10, -12, -10],
+        'ce_vega': [5, 6, 5],
+        'pe_vega': [5, 6, 5]
+    })
+
+@pytest.fixture
+def mock_position():
+    """Returns a valid position dictionary"""
+    return {
+        "symbol": "NIFTY21500CE",
+        "quantity": 50,
+        "side": "BUY",
+        "average_price": 100.0,
+        "current_price": 110.0,
+        "pnl": 500.0,
+        "greeks": {"delta": 0.5, "gamma": 0.001}
+    }
+
+@pytest.fixture
+def test_settings():
+    """Returns the settings object"""
+    return settings
