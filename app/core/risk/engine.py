@@ -4,7 +4,9 @@ import logging
 import numpy as np
 from scipy.stats import norm
 from typing import Dict, List, Any
-from app.schemas.analytics import RiskReport
+
+# Removed broken import: from app.schemas.analytics import RiskReport
+# The engine uses standard Dictionaries for reporting.
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +128,6 @@ class RiskEngine:
         # Simplified: We assume IV ~ VIX for speed, or we could solve it. 
         # For a High Frequency system, solving IV for every tick is expensive.
         # Smart Compromise: Use a broad assumption or VIX, but refine Delta based on moneyness.
-        # Actually, let's do a quick IV estimate or just use VIX passed in? 
-        # For now, assuming sigma=0.2 (20%) if unknown, or better, we could pass VIX.
-        # Let's assume input 'r' is actually 'sigma' (IV) for a moment? 
-        # No, the signature says 'r' (rate). 
-        # Let's use a standard 15% IV default if we can't solve, but ideally we should solve.
         
         sigma = 0.15 # Default
         
