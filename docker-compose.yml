@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  # ----------------------------------------------------------------
+  # ---
   # 1. DATABASE (Postgres 15)
-  # ----------------------------------------------------------------
+  # ---
   postgres:
     image: postgres:15-alpine
     container_name: volguard_db
@@ -23,13 +23,13 @@ services:
       retries: 5
     restart: always
 
-  # ----------------------------------------------------------------
+  # ---
   # 2. CACHE & STATE (Redis 7) - CRITICAL FOR EXECUTOR
-  # ----------------------------------------------------------------
+  # ---
   redis:
     image: redis:7-alpine
     container_name: volguard_redis
-    command: redis-server --appendonly yes  # Enable disk persistence
+    command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
     ports:
@@ -41,9 +41,9 @@ services:
       retries: 3
     restart: always
 
-  # ----------------------------------------------------------------
+  # ......
   # 3. TRADING SUPERVISOR (The Brain)
-  # ----------------------------------------------------------------
+  # ......
   supervisor:
     build: .
     container_name: volguard_supervisor
@@ -51,7 +51,6 @@ services:
       - POSTGRES_SERVER=postgres
       - REDIS_URL=redis://redis:6379/0
       - TZ=Asia/Kolkata
-      # Pass all other env vars automatically
       - POSTGRES_USER
       - POSTGRES_PASSWORD
       - POSTGRES_DB
@@ -66,15 +65,20 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./logs:/app/logs        # Persist logs
-      - ./journal:/app/journal  # Persist decision journals
-    # Use the restart-proof runner
+      - ./logs:/app/logs
+      - ./journal:/app/journal
     command: python run_supervisor.py
-    restart: always
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"logs\") else 1)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-  # ----------------------------------------------------------------
+  # ......
   # 4. API DASHBOARD (The Interface)
-  # ----------------------------------------------------------------
+  # ......
   api:
     build: .
     container_name: volguard_api
