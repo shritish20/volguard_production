@@ -12,7 +12,7 @@ jobs:
     name: Run Full Test Suite
     runs-on: ubuntu-latest
 
-    # Service containers (Mocking Redis/DB is fine, but good to have env ready)
+    # Service containers (Redis needed for integration tests if mocks are bypassed)
     services:
       redis:
         image: redis:alpine
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Set up Python 3.11 (Modern Async Support)
+      # 2. Set up Python 3.11 (Matching your environment)
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -43,9 +43,9 @@ jobs:
           # Install testing tools
           pip install pytest pytest-asyncio pytest-mock httpx
           # Install core libraries used in your code
-          pip install pandas numpy scipy fast_arrow redis pydantic fastapi uvicorn python-dotenv requests
+          pip install pandas numpy scipy fast_arrow redis pydantic pydantic-settings fastapi uvicorn python-dotenv requests
           
-          # If you have a requirements.txt, use it (Optional fallback)
+          # If you have a requirements.txt, use it as the source of truth
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       # 4. Create Directory Structure for Tests (Safety Check)
@@ -59,8 +59,8 @@ jobs:
         env:
           # Add current directory to python path so 'from app...' works
           PYTHONPATH: ${{ github.workspace }}
-          # Force Safe Environment for CI
-          ENVIRONMENT: SHADOW
+          # 🔴 FIX: Lowercase 'shadow' to match Pydantic Enum validation
+          ENVIRONMENT: shadow
           # Mock Secrets (Tests shouldn't need real keys)
           UPSTOX_API_KEY: "test_key"
           UPSTOX_API_SECRET: "test_secret"
