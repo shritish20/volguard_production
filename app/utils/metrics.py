@@ -635,3 +635,6 @@ def update_data_quality(quality_score: float):
 def update_component_health_simple(component: str, healthy: bool):
     """Update component health"""
     component_health.labels(component=component).set(1 if healthy else 0)
+
+# ALIASES FOR BACKWARD COMPATIBILITY
+cycle_duration = supervisor_cycle_duration
