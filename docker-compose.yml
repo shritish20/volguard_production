@@ -67,6 +67,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./journal:/app/journal
+      - ./state:/app/state  # 🔴 CRITICAL FIX #4: Persists Kill Switch State
     command: python run_supervisor.py
     restart: unless-stopped
     healthcheck:
@@ -91,9 +92,13 @@ services:
       - POSTGRES_USER
       - POSTGRES_PASSWORD
       - POSTGRES_DB
+      - UPSTOX_ACCESS_TOKEN
     depends_on:
       - postgres
       - redis
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state  # 🔴 CRITICAL FIX #4: Allows API to write Kill Switch
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     restart: always
 
