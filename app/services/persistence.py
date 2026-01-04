@@ -2,95 +2,84 @@
 
 import logging
 import pandas as pd
-from sqlalchemy.future import select
-from sqlalchemy.dialects.postgresql import insert
+from datetime import datetime, timedelta
+from sqlalchemy import text
 from app.database import AsyncSessionLocal
-from app.models.market_data import HistoricalCandle
+from app.services.cache import cache
 
 logger = logging.getLogger(__name__)
 
 class PersistenceService:
-    """
-    Handles all interactions between VolGuard and Postgres/Redis.
-    Separates 'Fetching' (Client) from 'Storing' (Service).
-    """
+    def __init__(self):
+        pass
 
-    async def save_daily_candles(self, df: pd.DataFrame, symbol: str):
-        """
-        Saves a DataFrame of candles to Postgres.
-        Uses 'UPSERT' logic to handle duplicates gracefully.
-        """
-        if df.empty:
-            return
-
+    async def save_daily_candle(self, symbol: str, data: dict):
+        """Upsert daily candle to Postgres"""
+        query = text("""
+            INSERT INTO historical_candles (symbol, timestamp, open, high, low, close, volume, oi)
+            VALUES (:symbol, :timestamp, :open, :high, :low, :close, :volume, :oi)
+            ON CONFLICT (symbol, timestamp) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                oi = EXCLUDED.oi;
+        """)
+        
         async with AsyncSessionLocal() as session:
             try:
-                # Convert DataFrame to list of dicts for bulk insert
-                records = []
-                for _, row in df.iterrows():
-                    records.append({
-                        "symbol": symbol,
-                        "timestamp": row["timestamp"],
-                        "open": row["open"],
-                        "high": row["high"],
-                        "low": row["low"],
-                        "close": row["close"],
-                        "volume": int(row["volume"]),
-                        "oi": int(row["oi"])
-                    })
-
-                # Efficient Postgres Upsert (On Conflict Do Update)
-                stmt = insert(HistoricalCandle).values(records)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['symbol', 'timestamp'],
-                    set_={
-                        "open": stmt.excluded.open,
-                        "high": stmt.excluded.high,
-                        "low": stmt.excluded.low,
-                        "close": stmt.excluded.close,
-                        "volume": stmt.excluded.volume,
-                        "oi": stmt.excluded.oi
-                    }
-                )
-                
-                await session.execute(stmt)
+                await session.execute(query, {
+                    "symbol": symbol,
+                    "timestamp": data["timestamp"],
+                    "open": data["open"],
+                    "high": data["high"],
+                    "low": data["low"],
+                    "close": data["close"],
+                    "volume": data.get("volume", 0),
+                    "oi": data.get("oi", 0)
+                })
                 await session.commit()
-                logger.info(f"Persisted {len(records)} candles for {symbol}")
-
             except Exception as e:
-                logger.error(f"Failed to save daily candles: {e}")
-                await session.rollback()
+                logger.error(f"Failed to save candle: {e}")
 
     async def load_daily_history(self, symbol: str, days: int = 365) -> pd.DataFrame:
         """
-        Loads history from DB for the VolatilityEngine.
-        This allows the system to boot even if Upstox Historical API is down.
+        Fetch history with Redis Caching (1 Hour TTL).
         """
-        async with AsyncSessionLocal() as session:
+        cache_key = f"hist:{symbol}:{days}"
+        
+        # 1. Try Redis
+        cached_json = await cache.get(cache_key)
+        if cached_json:
             try:
-                # Select last N days
-                # Note: Logic to filter by date would be better, but simple limit works for now
-                stmt = (
-                    select(HistoricalCandle)
-                    .where(HistoricalCandle.symbol == symbol)
-                    .order_by(HistoricalCandle.timestamp.asc())
-                )
-                result = await session.execute(stmt)
-                candles = result.scalars().all()
+                # Assuming JSON was saved with orient='split' or default
+                return pd.read_json(cached_json) 
+            except ValueError:
+                pass # JSON error, fall through to DB
 
-                if not candles:
-                    return pd.DataFrame()
+        # 2. Fetch from DB
+        cutoff = datetime.now() - timedelta(days=days)
+        query = text("""
+            SELECT timestamp, open, high, low, close, volume, oi
+            FROM historical_candles
+            WHERE symbol = :symbol AND timestamp >= :cutoff
+            ORDER BY timestamp ASC
+        """)
 
-                data = [c.to_dict() for c in candles]
-                df = pd.DataFrame(data)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                
-                # Filter for requested days (Logic moved to Pandas for simplicity vs SQL date math)
-                cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-                df = df[df['timestamp'] >= cutoff]
-                
-                return df.sort_values('timestamp').reset_index(drop=True)
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(query, {"symbol": symbol, "cutoff": cutoff})
+            rows = result.fetchall()
 
-            except Exception as e:
-                logger.error(f"Failed to load history from DB: {e}")
-                return pd.DataFrame()
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+
+        # 3. Save to Redis (Async)
+        if not df.empty:
+            await cache.set(cache_key, df.to_json(), ttl=3600)
+
+        return df
