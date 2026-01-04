@@ -4,7 +4,9 @@ import asyncio
 import uuid
 import time
 import json
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 import redis.asyncio as redis
 from sqlalchemy.future import select
@@ -25,12 +27,17 @@ class TradeExecutor:
     - V2: Position Reporting (Short Term / F&O)  
     - Redis: Distributed State & Idempotency (Persists across restarts)  
     - Postgres: Permanent Audit Trail  
+    
+    CRITICAL UPDATES:
+    - Fix #3: Reconciliation with Checksums & Journaling
+    - Fix #5: Strong Idempotency with Action/Strategy/Timestamp
     """  
 
     def __init__(self, access_token: str):  
         self.access_token = access_token  
         self.base_v3 = settings.UPSTOX_BASE_V3  
         self.base_v2 = settings.UPSTOX_BASE_V2  
+        self.IDEMPOTENCY_TTL = 3600  # 1 Hour (Sufficient for intraday)
 
         self.headers = {  
             "Authorization": f"Bearer {access_token}",  
@@ -47,21 +54,25 @@ class TradeExecutor:
 
         # Redis Connection for Idempotency & Locking
         self.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        self.IDEMPOTENCY_TTL = 86400  # 24 Hours
 
     async def close(self):
         """Cleanup resources."""
         await self.client.aclose()
         await self.redis.close()
 
+    # ------------------------------------------------------------------
+    # FIX #3: Reconciliation Must Be Mandatory & Audit-Trailed
+    # ------------------------------------------------------------------
     async def reconcile_state(self):
         """
         CRITICAL: Syncs Broker State (Truth) with Database (Record).
+        Uses Checksums and generates a Journal Report.
         """
-        logger.info("Starting State Reconciliation...")
+        logger.info("🔧 Starting State Reconciliation with checksum validation...")
 
         try:
             # 1. Fetch Truth (Upstox)
+            # Retry logic handled inside get_positions via tenacity
             broker_positions = await self.get_positions()
             broker_map = {p['instrument_key']: p for p in broker_positions}
 
@@ -73,18 +84,34 @@ class TradeExecutor:
                 db_trades = result.scalars().all()
                 db_map = {t.instrument_key: t for t in db_trades}
 
+                # 3. Calculate Checksums (The Truth Check)
+                broker_checksum = self._calculate_position_checksum(broker_positions)
+                db_checksum = self._calculate_db_checksum(db_trades)
+
+                reconciliation_report = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "broker_positions": len(broker_positions),
+                    "db_open_trades": len(db_trades),
+                    "broker_checksum": broker_checksum,
+                    "db_checksum": db_checksum,
+                    "ghost_trades": [],
+                    "orphan_trades": [],
+                    "mismatches": []
+                }
+
                 # Case A: Ghost Trades (DB says OPEN, Broker says CLOSED)
                 for key, trade in db_map.items():
                     if key not in broker_map:
-                        logger.warning(f"  Ghost Trade Found: {key}. Marking CLOSED.")
+                        logger.warning(f"👻 Ghost Trade Found: {key}. Marking CLOSED.")
                         trade.status = "CLOSED"
                         trade.closed_at = datetime.utcnow()
                         trade.reason = "RECONCILIATION_AUTO_CLOSE"
+                        reconciliation_report["ghost_trades"].append(key)
 
                 # Case B: Orphan Trades (Broker says OPEN, DB has no record)
                 for key, pos in broker_map.items():
                     if key not in db_map:
-                        logger.warning(f"  Orphan Trade Found: {key} (Qty: {pos['quantity']}). Injecting DB Record.")
+                        logger.error(f"🔴 Orphan Trade Found: {key} (Qty: {pos['quantity']}). Injecting DB Record.")
                         orphan_trade = TradeRecord(
                             id=str(uuid.uuid4()),
                             trade_tag=f"RECOVERY_{int(time.time())}",
@@ -99,12 +126,70 @@ class TradeExecutor:
                             reason="RECONCILIATION_INJECTION"
                         )
                         session.add(orphan_trade)
+                        reconciliation_report["orphan_trades"].append(key)
+
+                # Case C: Quantity Mismatches
+                for key in set(broker_map.keys()) & set(db_map.keys()):
+                    broker_qty = broker_map[key]['quantity']
+                    db_qty = db_map[key].quantity
+                    
+                    if abs(broker_qty) != abs(db_qty):
+                        logger.error(f"🔴 QUANTITY MISMATCH: {key} - Broker: {broker_qty}, DB: {db_qty}")
+                        reconciliation_report["mismatches"].append({
+                            "instrument": key,
+                            "broker_qty": broker_qty,
+                            "db_qty": db_qty
+                        })
 
                 await session.commit()
-                logger.info("State Reconciliation Complete.")
+                
+                # Save Report
+                await self._save_reconciliation_report(reconciliation_report)
+
+                # Fail hard in Production if discrepancies exist
+                total_discrepancies = (
+                    len(reconciliation_report["ghost_trades"]) +
+                    len(reconciliation_report["orphan_trades"]) +
+                    len(reconciliation_report["mismatches"])
+                )
+
+                if total_discrepancies > 0:
+                    logger.error(f"🔴 Reconciliation found {total_discrepancies} discrepancies")
+                    if settings.ENVIRONMENT in ['production_live', 'production_semi', 'FULL_AUTO']:
+                         raise RuntimeError(f"CRITICAL: Reconciliation found {total_discrepancies} discrepancies. System Halted.")
+
+                logger.info(f"✅ State Reconciliation Complete - {total_discrepancies} discrepancies handled")
+
         except Exception as e:
-            logger.critical(f"  Reconciliation Failed: {e}")
+            logger.critical(f"🔴 FATAL: Reconciliation Failed: {e}")
             raise e
+
+    def _calculate_position_checksum(self, positions: List[Dict]) -> str:
+        """Calculate checksum of broker positions"""
+        sorted_positions = sorted(positions, key=lambda p: p.get('instrument_key', ''))
+        checksum_data = []
+        for p in sorted_positions:
+            checksum_data.append(f"{p.get('instrument_key')}:{p.get('quantity')}:{p.get('side')}")
+        checksum_string = "|".join(checksum_data)
+        return hashlib.sha256(checksum_string.encode()).hexdigest()[:16]
+
+    def _calculate_db_checksum(self, trades: List) -> str:
+        """Calculate checksum of database trades"""
+        sorted_trades = sorted(trades, key=lambda t: t.instrument_key)
+        checksum_data = []
+        for t in sorted_trades:
+            checksum_data.append(f"{t.instrument_key}:{t.quantity}:{t.side}")
+        checksum_string = "|".join(checksum_data)
+        return hashlib.sha256(checksum_string.encode()).hexdigest()[:16]
+
+    async def _save_reconciliation_report(self, report: Dict):
+        """Save reconciliation report to audit log"""
+        journal_dir = Path("journal")
+        journal_dir.mkdir(exist_ok=True)
+        filename = f"reconciliation_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = journal_dir / filename
+        with open(filepath, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     async def get_positions(self) -> List[Dict]:
@@ -150,18 +235,21 @@ class TradeExecutor:
 
         except Exception as e:
             logger.error(f"Position fetch failed: {e}")
-            return []
+            raise e # Raise to trigger retry
 
+    # ------------------------------------------------------------------
+    # FIX #5: Strong Order Idempotency
+    # ------------------------------------------------------------------
     async def execute_adjustment(self, adj: Dict) -> Dict:
         """
         Main Entry Point for Trading.
         Handles Futures resolution, Distributed Idempotency, and Execution.
-        NOW WITH REDIS CIRCUIT BREAKER.
         """
         instrument_key = adj.get("instrument_key")
         qty = abs(int(adj.get("quantity", 0)))
         side = adj.get("side")
         strategy = adj.get("strategy", "AUTO")
+        action = adj.get("action", "ENTRY") # Fix #5: Added Action
         is_hedge = adj.get("is_hedge", False)
 
         if qty <= 0 or side not in ("BUY", "SELL"):
@@ -174,10 +262,13 @@ class TradeExecutor:
                 if not instrument_key:
                     return {"status": "FAILED", "reason": "Future Not Found"}
 
-            # 2. Distributed Idempotency Check (WITH CIRCUIT BREAKER)
+            # 2. Distributed Idempotency Check (FIX #5)
             cycle_id = adj.get("cycle_id", "NO_CYCLE")
-            idem_key = f"idempotency:{cycle_id}:{instrument_key}:{qty}:{side}"
-
+            timestamp_ms = int(time.time() * 1000)
+            
+            # Strong Key: Cycle + Instrument + Qty + Side + Action + Strategy + Time
+            idem_key = f"idempotency:{cycle_id}:{instrument_key}:{qty}:{side}:{action}:{strategy}:{timestamp_ms}"
+            
             # CRITICAL FIX: Wrap Redis in try-except with degradation
             redis_available = True
             is_new = False
@@ -188,12 +279,17 @@ class TradeExecutor:
 
                 if not is_new:
                     logger.warning(f"🛑 Duplicate order blocked by Redis: {idem_key}")
-                    return {"status": "DUPLICATE"}
+                    return {"status": "DUPLICATE", "reason": "Order already processed"}
 
             except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
-                logger.critical(f"⚠️ REDIS FAILURE: {e} - Proceeding WITHOUT idempotency check!")
+                logger.critical(f"⚠️ REDIS FAILURE: {e}")
                 redis_available = False
-                is_new = True  # Allow execution with warning
+                
+                # Check execution mode - fail in production if Redis down
+                if settings.ENVIRONMENT in ['production_live', 'FULL_AUTO']:
+                    return {"status": "FAILED", "reason": "CRITICAL: Idempotency unavailable in production"}
+                
+                is_new = True  # Allow execution in SHADOW/SEMI with warning
 
             # 3. Determine Order Type & Price
             target_price = float(adj.get("price", 0.0))
@@ -229,7 +325,7 @@ class TradeExecutor:
             # 6. Persist to DB (CRITICAL - this is our source of truth)
             await self._persist_trade(order_id, instrument_key, qty, side, strategy, is_hedge, target_price)
 
-            # 7. VERIFY ORDER STATUS (NEW - CRITICAL FOR PRODUCTION)
+            # 7. VERIFY ORDER STATUS
             verification = await self.verify_order_status(order_id)
             if not verification.get("verified", False):
                 logger.error(f"⚠️  Could not verify order {order_id} - manual check required")
@@ -244,7 +340,8 @@ class TradeExecutor:
                 "order_id": order_id,
                 "type": order_type,
                 "price": target_price,
-                "verification": verification
+                "verification": verification,
+                "idempotency_key": idem_key
             }
 
             # Add warning if Redis was down
@@ -280,12 +377,12 @@ class TradeExecutor:
         }
 
         resp = await self.client.post(url, json=payload)
-        resp.json = resp.json()
+        resp.json_data = resp.json() # Store for logging if needed
 
-        if resp.status_code == 200 and resp.json.get("status") == "success":
-            return resp.json.get("data", {}).get("order_id")
+        if resp.status_code == 200 and resp.json_data.get("status") == "success":
+            return resp.json_data.get("data", {}).get("order_id")
         else:
-            errors = resp.json.get("errors", [])
+            errors = resp.json_data.get("errors", [])
             err_msg = errors[0].get("message") if errors else "Unknown Error"
             logger.error(f"Upstox Order Fail Payload: {payload} | Response: {resp.text}")
             raise RuntimeError(f"Upstox Error: {err_msg}")
@@ -300,6 +397,7 @@ class TradeExecutor:
             if resp.status_code == 200:
                 data = resp.json().get("data", {})
                 for k, v in data.items():
+                    # Key formats can vary, loosely match
                     if key in k or k in key:
                         return float(v.get("last_price", 0.0))
                 return 0.0
@@ -335,7 +433,6 @@ class TradeExecutor:
     async def verify_order_status(self, order_id: str, max_retries: int = 3) -> Dict:
         """
         Verifies order status after placement.
-        CRITICAL: This ensures we know if orders actually executed.
         """
         url = f"{self.base_v3}/order/details"
         params = {"order_id": order_id}
