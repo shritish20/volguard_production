@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import settings
-from app.models.base import Base  # <--- FIXED: Import Base from shared module
+from app.models.base import Base  # Correctly importing Base from shared module
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,6 @@ AsyncSessionLocal = sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False
 )
-
-# Base declaration removed here to avoid circular imports.
-# It is now imported from app.models.base
 
 # ==== TRADE RECORDS ====
 class TradeRecord(Base):
@@ -70,34 +67,8 @@ class DecisionJournal(Base):
     risks = Column(JSON)
     details = Column(JSON)
 
-# ==== HISTORICAL DATA (Smart VolGuard Addition) ====
-class HistoricalCandle(Base):
-    """Tier 1 Data Storage: Daily Candles"""
-    __tablename__ = "historical_candles"
-
-    symbol = Column(String, primary_key=True, nullable=False)
-    timestamp = Column(DateTime, primary_key=True, nullable=False)
-    open = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    close = Column(Float)
-    volume = Column(BigInteger)
-    oi = Column(BigInteger)
-
-    __table_args__ = (
-        Index('idx_symbol_ts', 'symbol', 'timestamp'),
-    )
-
-    def to_dict(self):
-        return {
-            "timestamp": self.timestamp,
-            "open": self.open,
-            "high": self.high,
-            "low": self.low,
-            "close": self.close,
-            "volume": self.volume,
-            "oi": self.oi
-        }
+# NOTE: The HistoricalCandle class was removed from here because it is defined 
+# in app/models/market_data.py. This resolves the duplicate table error.
 
 # ==== INITIALIZATION ====
 async def init_db():
