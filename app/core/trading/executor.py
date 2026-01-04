@@ -190,27 +190,26 @@ class TradeExecutor:
         if qty <= 0 or side not in ("BUY", "SELL"):
             return {"status": "FAILED", "reason": "Invalid Order Params"}
 
-        # 1. Resolve Dynamic Futures
-        if instrument_key == "NIFTY_FUT_CURRENT":
-            instrument_key = registry.get_current_future("NIFTY")
-            if not instrument_key:
-                return {"status": "FAILED", "reason": "Future Not Found"}
-
-        # 2. Distributed Idempotency Check (Redis)
-        # Key: "idempotency:KEY:QTY:SIDE:STRATEGY"
-        # We use a cycle-aware ID if provided, otherwise generic
-        cycle_id = adj.get("cycle_id", "NO_CYCLE")
-        idem_key = f"idempotency:{cycle_id}:{instrument_key}:{qty}:{side}"
-        
-        # ATOMIC LOCK: setnx (Set if Not Exists)
-        # If this returns True, we acquired the lock. If False, it's a duplicate.
-        is_new = await self.redis.set(idem_key, "PENDING", ex=self.IDEMPOTENCY_TTL, nx=True)
-        
-        if not is_new:
-            logger.warning(f"🛑 Duplicate order blocked by Redis: {idem_key}")
-            return {"status": "DUPLICATE"}
-
+        # FIXED: Logic moved inside TRY block to handle Redis crashes gracefully
         try:
+            # 1. Resolve Dynamic Futures
+            if instrument_key == "NIFTY_FUT_CURRENT":
+                instrument_key = registry.get_current_future("NIFTY")
+                if not instrument_key:
+                    return {"status": "FAILED", "reason": "Future Not Found"}
+
+            # 2. Distributed Idempotency Check (Redis)
+            # Key: "idempotency:KEY:QTY:SIDE:STRATEGY"
+            cycle_id = adj.get("cycle_id", "NO_CYCLE")
+            idem_key = f"idempotency:{cycle_id}:{instrument_key}:{qty}:{side}"
+            
+            # ATOMIC LOCK: setnx (Set if Not Exists)
+            is_new = await self.redis.set(idem_key, "PENDING", ex=self.IDEMPOTENCY_TTL, nx=True)
+            
+            if not is_new:
+                logger.warning(f"🛑 Duplicate order blocked by Redis: {idem_key}")
+                return {"status": "DUPLICATE"}
+
             # 3. Determine Order Type & Price
             target_price = float(adj.get("price", 0.0))
             order_type = "MARKET"
@@ -250,9 +249,7 @@ class TradeExecutor:
             }
 
         except Exception as e:
-            # Release lock on failure so we can retry if needed? 
-            # Ideally NO, we keep it locked to prevent a retry loop bombarding the API.
-            # We just log it.
+            # Now even Redis failures are caught here
             logger.error(f"Execution Failed: {e}")
             return {"status": "FAILED", "error": str(e)}
 
