@@ -20,9 +20,9 @@ class MarketDataClient:
     VolGuard Smart Market Client (VolGuard 3.0)
     
     Architecture:
-    - V3: Execution, History, Fast LTP
-    - V2: Rich Data (Chain, Depth, Holidays)
-    - Async: strictly non-blocking (httpx)
+    V3: Execution, History, Fast LTP
+    V2: Rich Data (Chain, Depth, Holidays)
+    Async: strictly non-blocking (httpx)
     """
 
     def __init__(self, access_token: str, base_url_v2: str = "https://api.upstox.com/v2", base_url_v3: str = "https://api.upstox.com/v3"):
@@ -36,7 +36,7 @@ class MarketDataClient:
         
         # Async Client with reasonable timeouts
         self.client = httpx.AsyncClient(
-            headers=self.headers, 
+            headers=self.headers,
             timeout=10.0,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
         )
@@ -44,10 +44,10 @@ class MarketDataClient:
     async def close(self):
         await self.client.aclose()
 
-    # ==================================================================
+    # ==========================================
     # 1. MASTER CLOCK & METADATA (V2)
-    # ==================================================================
-    
+    # ==========================================
+
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     async def get_holidays(self) -> List[date]:
         """
@@ -63,7 +63,7 @@ class MarketDataClient:
             holidays = []
             for item in data:
                 # Filter for NSE trading holidays
-                if "NSE" in item.get("exchange", []) and item.get("closed", False):
+                if "NSE" in item.get("exchange", "") and item.get("closed", False):
                     d_str = item.get("date")
                     if d_str:
                         holidays.append(datetime.strptime(d_str, "%Y-%m-%d").date())
@@ -90,6 +90,7 @@ class MarketDataClient:
             
             # Get the first valid contract to extract metadata
             contract = data[0]
+            
             return {
                 "lot_size": int(contract.get("lot_size", 50)),
                 "freeze_limit": int(contract.get("freeze_quantity", 1800)),
@@ -97,25 +98,27 @@ class MarketDataClient:
             }
         except Exception as e:
             logger.error(f"Failed to fetch contract details: {e}")
-            return {"lot_size": 50, "freeze_limit": 1800} # Safe defaults
+            return {"lot_size": 50, "freeze_limit": 1800}  # Safe defaults
 
-    # ==================================================================
-    # 2. HISTORICAL DATA (V3 - "SMART" SPLIT)
-    # ==================================================================
+    # ==========================================
+    # 2. HISTORICAL DATA (V3 "SMART" SPLIT)
+    # ==========================================
 
     @retry(stop=stop_after_attempt(2), wait=wait_fixed(1))
     async def get_daily_candles(self, instrument_key: str, days: int = 365) -> pd.DataFrame:
         """
         TIER 1: COLD STORAGE
         Fetch Daily Candles for Postgres.
-        Endpoint: /v3/historical-candle/.../day/...
+        
+        FIXED: Uses plural 'days' instead of singular 'day'.
+        Endpoint: /v3/historical-candle/{key}/days/{interval}/{to}/{from}
         """
         encoded_key = quote(instrument_key, safe="")
         to_date = date.today().strftime("%Y-%m-%d")
         from_date = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
         
-        # V3 Path: /historical-candle/{key}/{unit}/{interval}/{to}/{from}
-        url = f"{self.base_v3}/historical-candle/{encoded_key}/day/1/{to_date}/{from_date}"
+        # FIXED: Changed '/day/1/' to '/days/1/'
+        url = f"{self.base_v3}/historical-candle/{encoded_key}/days/1/{to_date}/{from_date}"
         
         try:
             resp = await self.client.get(url)
@@ -124,12 +127,12 @@ class MarketDataClient:
             
             if not data:
                 return pd.DataFrame()
-                
+            
             # Upstox: [Timestamp, Open, High, Low, Close, Volume, OI]
             df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            return df.sort_values("timestamp").reset_index(drop=True)
             
+            return df.sort_values("timestamp").reset_index(drop=True)
         except Exception as e:
             logger.error(f"Daily candle fetch failed for {instrument_key}: {e}")
             return pd.DataFrame()
@@ -139,13 +142,14 @@ class MarketDataClient:
         """
         TIER 2: WARM CACHE
         Fetch Intraday Candles for Fast Vol / Crash Detection.
-        Endpoint: /v3/historical-candle/intraday/...
+        
+        FIXED: Uses plural 'minutes' instead of singular 'minute'.
+        Endpoint: /v3/historical-candle/intraday/{key}/minutes/{interval}
         """
         encoded_key = quote(instrument_key, safe="")
         
-        # Map minutes to URL format
-        # URL: /v3/historical-candle/intraday/{key}/{unit}/{interval}
-        url = f"{self.base_v3}/historical-candle/intraday/{encoded_key}/minute/{interval_minutes}"
+        # FIXED: Changed '/minute/' to '/minutes/'
+        url = f"{self.base_v3}/historical-candle/intraday/{encoded_key}/minutes/{interval_minutes}"
         
         try:
             resp = await self.client.get(url)
@@ -154,20 +158,19 @@ class MarketDataClient:
             
             if not data:
                 return pd.DataFrame()
-
+            
             df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             
             # Sort is critical for volatility calc
             return df.sort_values("timestamp").reset_index(drop=True)
-            
         except Exception as e:
             logger.error(f"Intraday fetch failed for {instrument_key}: {e}")
             return pd.DataFrame()
 
-    # ==================================================================
+    # ==========================================
     # 3. LIVE MARKET DATA (HYBRID V2/V3)
-    # ==================================================================
+    # ==========================================
 
     async def get_live_quote(self, keys: List[str]) -> Dict[str, float]:
         """
@@ -211,8 +214,8 @@ class MarketDataClient:
         try:
             resp = await self.client.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json().get("data", {}).get(instrument_key, {})
             
+            data = resp.json().get("data", {}).get(instrument_key, {})
             if not data:
                 return {"liquid": False, "spread": 999.9}
                 
@@ -228,7 +231,7 @@ class MarketDataClient:
             
             # Spread Logic
             spread = best_ask - best_bid
-            is_liquid = spread <= 5.0 and best_bid > 0 # Configurable threshold
+            is_liquid = spread <= 5.0 and best_bid > 0  # Configurable threshold
             
             return {
                 "liquid": is_liquid,
@@ -240,14 +243,13 @@ class MarketDataClient:
                 "upper_circuit": data.get("upper_circuit_limit"),
                 "lower_circuit": data.get("lower_circuit_limit")
             }
-            
         except Exception as e:
             logger.error(f"Depth fetch failed for {instrument_key}: {e}")
             return {"liquid": False, "spread": 999.9, "error": str(e)}
 
-    # ==================================================================
+    # ==========================================
     # 4. STRUCTURE DATA (V2)
-    # ==================================================================
+    # ==========================================
 
     @retry(stop=stop_after_attempt(2), wait=wait_fixed(0.5))
     async def get_option_chain(self, expiry_date: str) -> pd.DataFrame:
@@ -264,18 +266,18 @@ class MarketDataClient:
         try:
             resp = await self.client.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json().get("data", [])
             
+            data = resp.json().get("data", [])
             if not data:
                 return pd.DataFrame()
-                
+            
             rows = []
             for x in data:
                 ce = x.get("call_options", {})
                 pe = x.get("put_options", {})
                 
                 # Filter bad data
-                if not ce or not pe: 
+                if not ce or not pe:
                     continue
                     
                 ce_greeks = ce.get("option_greeks", {})
@@ -292,7 +294,7 @@ class MarketDataClient:
                     "ce_gamma": float(ce_greeks.get("gamma", 0) or 0),
                     "pe_gamma": float(pe_greeks.get("gamma", 0) or 0),
                     "ce_oi": int(ce.get("market_data", {}).get("oi", 0)),
-                    "pe_oi": int(pe.get("market_data", {}).get("oi", 0))
+                    "pe_oi": int(pe.get("market_data", {}).get("oi", 0)),
                 })
                 
             return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
@@ -308,11 +310,11 @@ class MarketDataClient:
     async def get_vix(self) -> float:
         res = await self.get_live_quote([VIX_KEY])
         return res.get(VIX_KEY, 0.0)
-    
-    # ==================================================================
+
+    # ==========================================
     # 5. EXPIRY UTILITIES (V2)
-    # ==================================================================
-    
+    # ==========================================
+
     async def get_expiries(self) -> Tuple[Optional[str], Optional[str]]:
         """
         Returns (Weekly Expiry, Monthly Expiry).
@@ -328,10 +330,10 @@ class MarketDataClient:
             
             if not data:
                 return None, None
-                
+            
             # Parse and Sort Unique Expiries
             expiries = sorted(list(set(
-                datetime.strptime(c["expiry"], "%Y-%m-%d").date() 
+                datetime.strptime(c["expiry"], "%Y-%m-%d").date()
                 for c in data if c.get("expiry")
             )))
             
@@ -342,13 +344,12 @@ class MarketDataClient:
             if not valid_expiries:
                 return None, None
                 
-            # Logic: 
+            # Logic:
             # Weekly = Nearest valid
-            # Monthly = Farthest in current or next month (simplified for now to just next available if needed)
-            # In a real engine, we'd check "Last Thursday" logic, but API data is authoritative.
+            # Monthly = Farthest in current or next month (simplified for now)
             
             weekly = valid_expiries[0].strftime("%Y-%m-%d")
-            monthly = valid_expiries[-1].strftime("%Y-%m-%d") # Placeholder logic, usually sufficient for next few cycles
+            monthly = valid_expiries[-1].strftime("%Y-%m-%d")
             
             return weekly, monthly
             
