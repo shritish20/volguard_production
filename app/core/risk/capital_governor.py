@@ -1,8 +1,8 @@
 import asyncio
 import logging
 from typing import List, Dict, Optional
-from datetime import datetime, date
-import numpy as np  # Added for margin heuristics
+from datetime import datetime, date, timedelta
+import numpy as np
 
 from app.core.risk.schemas import MarginCheckResult
 from app.config import settings
@@ -20,7 +20,7 @@ class CapitalGovernor:
         self.position_count = 0
         self.failed_margin_calls = 0
         
-        # FIX: Margin learning system
+        # Margin learning system
         self.margin_history = []  # Stores {"margin_per_lot": float, "timestamp": datetime}
 
     async def get_available_funds(self) -> float:
@@ -28,7 +28,6 @@ class CapitalGovernor:
         Mockable method to get available funds from Broker API
         """
         # In a real implementation, this would call the broker API
-        # For this showcase, we return a simulation or cache
         return self.total_capital + self.daily_pnl
 
     async def predict_margin_requirement(self, legs: List[Dict]) -> float:
@@ -37,7 +36,6 @@ class CapitalGovernor:
         """
         # This acts as the interface to the Upstox Margin API
         # Implementation would use the self.access_token to fetch real data
-        # Raising NotImplementedError to ensure the mock/real implementation is used
         raise NotImplementedError("This method must be implemented by the API client wrapper")
 
     async def estimate_brokerage(self, legs: List[Dict]) -> float:
@@ -46,10 +44,6 @@ class CapitalGovernor:
         """
         num_orders = len(legs)
         return num_orders * 25.0  # Conservative estimate
-
-    # ------------------------------------------------------------------
-    # FIX #1: Margin Fallback - Hard Fail in Production
-    # ------------------------------------------------------------------
 
     async def can_trade_new(self, legs: List[Dict], strategy_name: str = "MANUAL") -> MarginCheckResult:
         """
@@ -100,12 +94,12 @@ class CapitalGovernor:
             logger.error(f"⚠️ CRITICAL: Margin API failed: {e}")
             
             # 🔴 HARD FAIL IN PRODUCTION MODES
-            from app.lifecycle.safety_controller import ExecutionMode
+            # Robust Env check (handles Enums or Strings)
+            current_env = str(settings.ENVIRONMENT).lower()
+            if hasattr(settings.ENVIRONMENT, 'value'):
+                current_env = str(settings.ENVIRONMENT.value).lower()
             
-            # Check execution mode from settings
-            current_mode = getattr(settings, 'EXECUTION_MODE', 'SHADOW')
-            
-            if current_mode in ['FULL_AUTO', 'production_live']:
+            if current_env in ['full_auto', 'production_live']:
                 logger.critical("🛑 BLOCKING TRADE: Margin API unavailable in FULL_AUTO mode")
                 return MarginCheckResult(
                     allowed=False,
@@ -114,7 +108,7 @@ class CapitalGovernor:
                     available_margin=available_funds
                 )
             
-            elif current_mode in ['SEMI_AUTO', 'production_semi']:
+            elif current_env in ['semi_auto', 'production_semi']:
                 logger.error("⚠️ Using margin heuristic in SEMI_AUTO (requires manual approval)")
                 required_margin = self._estimate_margin_heuristic(legs)
                 margin_source = "HEURISTIC_FALLBACK"
@@ -158,12 +152,11 @@ class CapitalGovernor:
         
         # Use historical margin data if available
         if hasattr(self, 'margin_history') and len(self.margin_history) >= 10:
-            # Calculate per-lot average from last 100 trades
             historical_margins = [m['margin_per_lot'] for m in self.margin_history]
-            avg_margin_per_lot = np.percentile(historical_margins, 95)  # 95th percentile for safety
+            avg_margin_per_lot = np.percentile(historical_margins, 95)
             
-            total_lots = sum(leg.get('quantity', 0) // 50 for leg in legs)  # Assuming 50 lot size
-            estimated = total_lots * avg_margin_per_lot * 1.20  # 20% safety buffer
+            total_lots = sum(leg.get('quantity', 0) // 50 for leg in legs)
+            estimated = total_lots * avg_margin_per_lot * 1.20
             
             logger.warning(f"Using learned margin estimate: ₹{estimated:,.0f} (based on {len(self.margin_history)} historical trades)")
             return estimated
@@ -174,30 +167,37 @@ class CapitalGovernor:
             side = leg.get("side", "BUY")
             
             if side == "SELL":
-                # Check if it's expiry day
                 expiry = leg.get("expiry")
                 if expiry:
+                    # Improved Parsing
                     if isinstance(expiry, str):
                         try:
+                            # Try standard YYYY-MM-DD
                             expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
                         except ValueError:
-                            # Handle cases where expiry might be in a different format or invalid
-                            expiry_date = date.today() # Fail safe to high margin
+                            try:
+                                # Try ISO Format (2024-12-26T00:00:00)
+                                expiry_date = datetime.fromisoformat(expiry).date()
+                            except:
+                                # Parsing failed. 
+                                # SAFETY DECISION: Assume it IS expiry day (High Margin) to prevent blowing up.
+                                logger.warning(f"⚠️ Could not parse expiry: {expiry}. Assuming WORST CASE (Today).")
+                                expiry_date = date.today()
                     else:
                         expiry_date = expiry.date() if hasattr(expiry, 'date') else expiry
                     
-                    # 🔴 CRITICAL FIX: Higher margin on expiry day
+                    # Higher margin on expiry day
                     if expiry_date == date.today():
-                        total += qty * 5000  # 250k per lot on expiry day
-                        logger.warning(f"⚠️ EXPIRY DAY: Using 5k per unit margin")
+                        total += qty * 5000  # 250k per lot
+                        logger.warning(f"⚠️ EXPIRY DAY: Using 5k per unit margin for {qty} units")
                     else:
-                        total += qty * 2400  # 120k per lot normal
+                        total += qty * 2400  # 120k per lot
                 else:
                     total += qty * 2400
             else:
                 total += qty * 200  # Max premium for buys
         
-        # Add 30% buffer for uncertainty
+        # Add 30% buffer
         buffered_total = total * 1.30
         
         logger.warning(f"⚠️ Using COLD START margin estimate: ₹{buffered_total:,.0f} (NO HISTORICAL DATA)")
@@ -205,7 +205,8 @@ class CapitalGovernor:
 
     def record_actual_margin(self, required_margin: float, num_lots: int):
         """
-        Call this after successful trade execution to learn actual margins
+        Call this after successful trade execution to learn actual margins.
+        (Called by Supervisor)
         """
         if num_lots > 0:
             margin_per_lot = required_margin / num_lots
@@ -221,3 +222,11 @@ class CapitalGovernor:
                 self.margin_history.pop(0)
             
             logger.info(f"📊 Learned margin: ₹{margin_per_lot:,.0f} per lot")
+
+    def update_pnl(self, realized_pnl: float):
+        """Update daily PnL"""
+        self.daily_pnl += realized_pnl
+
+    def update_position_count(self, count: int):
+        """Update position count"""
+        self.position_count = count
