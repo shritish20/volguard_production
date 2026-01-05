@@ -695,6 +695,7 @@ safety_violations = risk_limit_breaches
 # For supervisor compatibility - maintain old function names
 active_positions = active_positions_aggregate
 position_pnl = position_pnl_aggregate
+position_delta = position_delta_aggregate  # 🔴 CRITICAL FIX ADDED HERE
 
 # Simple aliases for functions
 set_system_state_simple = set_system_state
