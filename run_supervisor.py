@@ -1,5 +1,4 @@
 # run_supervisor.py
-
 import asyncio
 import logging
 import signal
@@ -12,7 +11,7 @@ from app.lifecycle.supervisor import ProductionTradingSupervisor
 from app.lifecycle.safety_controller import ExecutionMode
 
 # Core Components
-from app.core.market.data_client import MarketDataClient
+from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
 from app.core.market.websocket_client import MarketDataFeed
 from app.core.risk.engine import RiskEngine
 from app.core.risk.capital_governor import CapitalGovernor
@@ -67,28 +66,46 @@ async def main():
     logger.info("Connecting to Database...")
     await init_db()
 
-    # 2. Initialize Clients
+    # 2. Initialize Market Data Client
     market_client = MarketDataClient(
         settings.UPSTOX_ACCESS_TOKEN,
         settings.UPSTOX_BASE_V2,
         settings.UPSTOX_BASE_V3
     )
     
-    # Initialize Executor (Now connects to Redis automatically)
+    # 3. Initialize Trade Executor (Redis connection handled internally)
     trade_executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
     
+    # 4. Initialize WebSocket Service with CRITICAL FIX
     websocket_service = None
     if settings.SUPERVISOR_WEBSOCKET_ENABLED:
-        # Pass empty keys initially; Supervisor will subscribe dynamically
+        logger.info("🔌 Initializing WebSocket Service...")
+        
+        # ✅ CRITICAL FIX: Subscribe to NIFTY + VIX for live market data
         websocket_service = MarketDataFeed(
-            settings.UPSTOX_ACCESS_TOKEN, 
-            [] 
+            access_token=settings.UPSTOX_ACCESS_TOKEN,
+            instrument_keys=[NIFTY_KEY, VIX_KEY],  # ✅ Core market data subscription
+            mode="full",  # Get complete data including Greeks
+            auto_reconnect_enabled=True,  # Enable SDK auto-reconnect
+            reconnect_interval=10,  # Retry every 10 seconds
+            max_retries=5  # Max 5 reconnection attempts
         )
+        
+        logger.info(f"✅ WebSocket configured with subscriptions:")
+        logger.info(f"   • {NIFTY_KEY}")
+        logger.info(f"   • {VIX_KEY}")
+        logger.info(f"   • Mode: full (includes Greeks)")
+        logger.info(f"   • Auto-reconnect: Enabled (10s interval, 5 retries)")
+    else:
+        logger.warning("⚠️ WebSocket DISABLED - Using REST API fallback only")
 
-    # 3. Initialize Engines (FIXED PARAMETERS)
-    # 🔴 FIX: RiskEngine expects a float, not a dict
-    risk_engine = RiskEngine(max_portfolio_loss=settings.MAX_PORTFOLIO_LOSS)
+    # 5. Initialize Risk & Trading Engines
+    logger.info("⚙️ Initializing Trading Engines...")
     
+    # Risk Engine (expects float for max_portfolio_loss)
+    risk_engine = RiskEngine(max_portfolio_loss=settings.MAX_DAILY_LOSS)
+    
+    # Capital Governor
     cap_governor = CapitalGovernor(
         access_token=settings.UPSTOX_ACCESS_TOKEN,
         total_capital=settings.BASE_CAPITAL,
@@ -96,12 +113,14 @@ async def main():
         max_positions=settings.MAX_POSITIONS
     )
     
-    # Trading Engine gets the full config dump for strategy parameters
+    # Trading Engine (gets full config for strategy parameters)
     trading_engine = TradingEngine(market_client, settings.model_dump())
     
-    adj_engine = AdjustmentEngine(delta_threshold=15.0) 
+    # Adjustment Engine (delta hedging threshold)
+    adj_engine = AdjustmentEngine(delta_threshold=15.0)
 
-    # 4. Boot Supervisor
+    # 6. Initialize Supervisor
+    logger.info("🧠 Booting Production Supervisor...")
     supervisor = ProductionTradingSupervisor(
         market_client=market_client,
         risk_engine=risk_engine,
@@ -109,27 +128,28 @@ async def main():
         trade_executor=trade_executor,
         trading_engine=trading_engine,
         capital_governor=cap_governor,
-        websocket_service=websocket_service,
+        websocket_service=websocket_service,  # ✅ WebSocket now properly configured
         loop_interval_seconds=settings.SUPERVISOR_LOOP_INTERVAL
     )
 
-    # 5. Set Execution Mode based on Config
+    # 7. Set Execution Mode based on Environment
     if settings.ENVIRONMENT == "production_live":
-        logger.warning("!!! ⚠️ RUNNING IN FULL_AUTO MODE - REAL TRADING ENABLED !!!")
+        logger.warning("🚨 !!! RUNNING IN FULL_AUTO MODE - REAL TRADING ENABLED !!! 🚨")
+        logger.warning("🚨 !!! ALL TRADES WILL BE EXECUTED AUTOMATICALLY !!! 🚨")
         supervisor.safety.execution_mode = ExecutionMode.FULL_AUTO
     elif settings.ENVIRONMENT == "production_semi":
-        logger.info("Running in SEMI_AUTO Mode - Approvals Required")
+        logger.info("⚠️ Running in SEMI_AUTO Mode - Manual Approvals Required")
         supervisor.safety.execution_mode = ExecutionMode.SEMI_AUTO
     else:
-        logger.info("Running in SHADOW Mode - Monitoring Only")
+        logger.info("✅ Running in SHADOW Mode - Monitoring Only (Safe)")
         supervisor.safety.execution_mode = ExecutionMode.SHADOW
 
-    # 6. Signal Handling
+    # 8. Setup Signal Handlers for Graceful Shutdown
     loop = asyncio.get_running_loop()
     resources = {
         "MarketClient": market_client,
         "WebsocketService": websocket_service,
-        # "TradeExecutor": trade_executor # Executor relies on Redis, handled by container
+        "TradeExecutor": trade_executor  # Now included for proper cleanup
     }
     
     for signame in {'SIGINT', 'SIGTERM'}:
@@ -138,13 +158,20 @@ async def main():
             lambda s=signame: asyncio.create_task(shutdown(s, loop, supervisor, resources))
         )
 
-    # 7. Start Loop
+    # 9. Start Supervisor Loop
+    logger.info("🎯 Starting Supervisor Loop...")
+    logger.info(f"📊 Loop Interval: {settings.SUPERVISOR_LOOP_INTERVAL}s")
+    logger.info(f"💰 Base Capital: ₹{settings.BASE_CAPITAL:,.0f}")
+    logger.info(f"🛑 Max Daily Loss: ₹{settings.MAX_DAILY_LOSS:,.0f}")
+    logger.info(f"📈 Max Positions: {settings.MAX_POSITIONS}")
+    logger.info("=" * 60)
+    
     try:
         await supervisor.start()
     except asyncio.CancelledError:
         logger.info("Main task cancelled")
     except Exception as e:
-        logger.critical(f"Supervisor crashed: {e}", exc_info=True)
+        logger.critical(f"💥 Supervisor crashed: {e}", exc_info=True)
         # Attempt emergency cleanup
         await shutdown(signal.SIGTERM, loop, supervisor, resources)
 
@@ -152,4 +179,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
         pass  # Handled by signal handler
