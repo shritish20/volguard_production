@@ -53,6 +53,7 @@ class ProductionTradingSupervisor:
     MERGED VERSION:
     1. Drift-Correcting Loop & Prometheus Metrics (Your Code)
     2. Critical Fixes: Kill Switch persistence, Greeks Safety, Margin Learning (Fix Package)
+    3. FIX #2: Race Condition fixes with task tracking
     """
 
     def __init__(
@@ -117,6 +118,14 @@ class ProductionTradingSupervisor:
         self.cycle_times = deque(maxlen=100)  # Last 100 cycles
         self.avg_cycle_time = 0.0
 
+        # ============================================
+        # FIX #2: Task tracking for background tasks
+        # ============================================
+        self._background_tasks: set = set()
+        self._intraday_refresh_lock = asyncio.Lock()
+        self._position_update_lock = asyncio.Lock()
+        self._capital_update_lock = asyncio.Lock()
+
     async def start(self):
         """Main Entry Point - The Boot Sequence"""
         logger.info(f"Supervisor booting in {self.safety.execution_mode.value} mode")
@@ -165,7 +174,39 @@ class ProductionTradingSupervisor:
                 self.ws = None  # Disable but continue
 
         self.running = True
-        await self._run_loop()
+        
+        try:
+            await self._run_loop()
+        finally:
+            # ============================================
+            # FIX #2: Cleanup all background tasks
+            # ============================================
+            await self._cleanup_background_tasks()
+
+    async def _cleanup_background_tasks(self):
+        """Clean up all background tasks when stopping"""
+        if not self._background_tasks:
+            return
+        
+        logger.info(f"🛑 Cancelling {len(self._background_tasks)} background tasks...")
+        
+        # Cancel all tasks
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Wait for cancellation with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._background_tasks, return_exceptions=True),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Some background tasks didn't cancel cleanly")
+        except Exception as e:
+            logger.error(f"Error during task cleanup: {e}")
+        
+        self._background_tasks.clear()
 
     async def _run_loop(self):
         """
@@ -203,9 +244,13 @@ class ProductionTradingSupervisor:
                 # ============================================
                 start_time = time.time()
                 
-                # PHASE 1: SMART DATA REFRESH
+                # PHASE 1: SMART DATA REFRESH (with FIX #2 lock)
                 if time.time() - self.last_intraday_fetch > self.intraday_fetch_interval:
-                    asyncio.create_task(self._refresh_intraday_data())
+                    # FIX #2: Only start new task if not already running
+                    if not self._intraday_refresh_lock.locked():
+                        task = asyncio.create_task(self._refresh_intraday_data_safe())
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
 
                 snapshot = await self._read_live_snapshot()
                 valid, reason = self.quality.validate_snapshot(snapshot) # Assumes quality gate has this method, or use validate_structure
@@ -272,7 +317,10 @@ class ProductionTradingSupervisor:
                 cycle_log["portfolio_delta"] = portfolio_delta
                 cycle_log["positions_count"] = len(self.positions)
 
-                asyncio.create_task(self._update_capital_state())
+                # FIX #2: Background capital update with task tracking
+                capital_task = asyncio.create_task(self._update_capital_state_safe())
+                self._background_tasks.add(capital_task)
+                capital_task.add_done_callback(self._background_tasks.discard)
 
                 # PHASE 3: RISK SCAN
                 risk_report = await self.risk.run_stress_tests({}, snapshot, self.positions) if hasattr(self.risk, 'run_stress_tests') else {}
@@ -371,7 +419,10 @@ class ProductionTradingSupervisor:
                 await asyncio.sleep(crash_delay)
 
             finally:
-                asyncio.create_task(add_decision_log(cycle_log))
+                # FIX #2: Add decision log as background task with tracking
+                log_task = asyncio.create_task(add_decision_log(cycle_log))
+                self._background_tasks.add(log_task)
+                log_task.add_done_callback(self._background_tasks.discard)
 
                 # DRIFT CORRECTION
                 cycle_duration_actual = time.monotonic() - cycle_start_mono
@@ -390,6 +441,30 @@ class ProductionTradingSupervisor:
                 if abs(drift) > 0.1:
                     logger.warning(f"[{cycle_id}] Clock drift detected: {drift:.3f}s")
                     next_tick = current_mono
+
+    async def _refresh_intraday_data_safe(self):
+        """Wrapper with lock to prevent concurrent refreshes (FIX #2)"""
+        async with self._intraday_refresh_lock:
+            try:
+                self.intraday_data = await asyncio.wait_for(
+                    self.market.get_intraday_candles(NIFTY_KEY, interval_minutes=1),
+                    timeout=10.0
+                )
+                self.last_intraday_fetch = time.time()
+                logger.debug(f"Intraday data refreshed: {len(self.intraday_data)} rows")
+            except asyncio.TimeoutError:
+                logger.warning("Intraday data fetch timeout")
+            except Exception as e:
+                logger.error(f"Intraday refresh failed: {e}")
+
+    async def _update_capital_state_safe(self):
+        """Safe capital state update with lock (FIX #2)"""
+        async with self._capital_update_lock:
+            try:
+                funds = await self.cap_governor.get_available_funds()
+                self.cap_governor.position_count = len(self.positions)
+            except Exception as e:
+                logger.error(f"Capital state update failed: {e}")
 
     async def _read_live_snapshot(self) -> Dict:
         """
@@ -594,7 +669,7 @@ class ProductionTradingSupervisor:
             self.last_daily_fetch = time.time()
             logger.info(f"Daily data loaded: {len(self.daily_data)} rows")
             
-            await self._refresh_intraday_data()
+            await self._refresh_intraday_data_safe()
             
         except asyncio.TimeoutError:
             logger.error("Historical data fetch timeout (30s)")
@@ -603,85 +678,65 @@ class ProductionTradingSupervisor:
             logger.error(f"Historical data fetch failed: {e}")
             self.daily_data = pd.DataFrame()
 
-    async def _refresh_intraday_data(self):
-        """Background intraday refresh"""
-        try:
-            self.intraday_data = await asyncio.wait_for(
-                self.market.get_intraday_candles(NIFTY_KEY, interval_minutes=1),
-                timeout=10.0
-            )
-            self.last_intraday_fetch = time.time()
-            logger.debug(f"Intraday data refreshed: {len(self.intraday_data)} rows")
-        except asyncio.TimeoutError:
-            logger.warning("Intraday data fetch timeout")
-        except Exception as e:
-            logger.error(f"Intraday refresh failed: {e}")
-
-    async def _update_capital_state(self):
-        """Update capital state with error handling"""
-        try:
-            funds = await self.cap_governor.get_available_funds()
-            self.cap_governor.position_count = len(self.positions) # Ensure this attribute exists
-        except Exception as e:
-            logger.error(f"Capital state update failed: {e}")
-
-    # ------------------------------------------------------------------
+    # ============================================
     # FIX #2: Greeks Fabrication - Never Invent Critical Data
-    # ------------------------------------------------------------------
+    # ============================================
     async def _update_positions(self, snapshot) -> Dict:
         """
         🔴 CRITICAL FIX: Never trade on fabricated Greeks
         Checks for unreliable Greeks and halts if necessary.
         """
-        raw_list = await self.exec.get_positions()
-        pos_map = {}
-        missing_greeks_count = 0
-        
-        for p in raw_list:
-            try:
-                if "greeks" not in p or p["greeks"] is None:
-                    # Try to calculate Greeks
-                    t = self._calculate_time_to_expiry(p.get("expiry"))
-                    
-                    calculated_greeks = self.risk.calculate_leg_greeks(
-                        price=p.get("average_price", 0.0),
-                        spot=snapshot.get("spot", 0.0),
-                        strike=float(p.get("strike", 0)),
-                        time_years=t,
-                        r=self.risk.risk_free_rate, # Use dynamic rate
-                        opt_type=p.get("option_type", "CE")
-                    )
-                    
-                    if calculated_greeks is None:
-                        # 🔴 CANNOT CALCULATE RELIABLY
-                        missing_greeks_count += 1
-                        logger.error(f"⚠️ CRITICAL: Cannot calculate Greeks for {p.get('instrument_key')}")
-                        p["greeks"] = None
-                        p["unsafe_greeks"] = True
-                    else:
-                        p["greeks"] = calculated_greeks
-                        p["unsafe_greeks"] = False
-                
-                pos_map[p["position_id"]] = p
-                
-            except Exception as e:
-                logger.error(f"Position processing failed for {p.get('instrument_key')}: {e}")
-                continue
-        
-        # 🔴 CRITICAL: If too many positions have missing Greeks, HALT
-        if missing_greeks_count > 0:
-            logger.critical(f"🛑 {missing_greeks_count} positions have unreliable Greeks")
+        # FIX #2: Add lock to prevent concurrent position updates
+        async with self._position_update_lock:
+            raw_list = await self.exec.get_positions()
+            pos_map = {}
+            missing_greeks_count = 0
             
-            if len(pos_map) > 0 and missing_greeks_count >= len(pos_map) * 0.3:
-                logger.critical("🛑 HALTING: >30% of positions have unreliable Greeks")
-                self.safety.system_state = SystemState.HALTED
-                await self.safety.record_failure(
-                    "GREEKS_UNAVAILABLE",
-                    {"missing_count": missing_greeks_count, "total": len(pos_map)},
-                    "CRITICAL"
-                )
-        
-        return pos_map
+            for p in raw_list:
+                try:
+                    if "greeks" not in p or p["greeks"] is None:
+                        # Try to calculate Greeks
+                        t = self._calculate_time_to_expiry(p.get("expiry"))
+                        
+                        calculated_greeks = self.risk.calculate_leg_greeks(
+                            price=p.get("average_price", 0.0),
+                            spot=snapshot.get("spot", 0.0),
+                            strike=float(p.get("strike", 0)),
+                            time_years=t,
+                            r=self.risk.risk_free_rate, # Use dynamic rate
+                            opt_type=p.get("option_type", "CE")
+                        )
+                        
+                        if calculated_greeks is None:
+                            # 🔴 CANNOT CALCULATE RELIABLY
+                            missing_greeks_count += 1
+                            logger.error(f"⚠️ CRITICAL: Cannot calculate Greeks for {p.get('instrument_key')}")
+                            p["greeks"] = None
+                            p["unsafe_greeks"] = True
+                        else:
+                            p["greeks"] = calculated_greeks
+                            p["unsafe_greeks"] = False
+                    
+                    pos_map[p["position_id"]] = p
+                    
+                except Exception as e:
+                    logger.error(f"Position processing failed for {p.get('instrument_key')}: {e}")
+                    continue
+            
+            # 🔴 CRITICAL: If too many positions have missing Greeks, HALT
+            if missing_greeks_count > 0:
+                logger.critical(f"🛑 {missing_greeks_count} positions have unreliable Greeks")
+                
+                if len(pos_map) > 0 and missing_greeks_count >= len(pos_map) * 0.3:
+                    logger.critical("🛑 HALTING: >30% of positions have unreliable Greeks")
+                    self.safety.system_state = SystemState.HALTED
+                    await self.safety.record_failure(
+                        "GREEKS_UNAVAILABLE",
+                        {"missing_count": missing_greeks_count, "total": len(pos_map)},
+                        "CRITICAL"
+                    )
+            
+            return pos_map
 
     # ------------------------------------------------------------------
     # FIX #4: Kill Switch (Persistence)
@@ -762,5 +817,6 @@ class ProductionTradingSupervisor:
             "last_successful_cycle": self.last_successful_cycle,
             "positions_count": len(self.positions),
             "system_state": self.safety.system_state.name,
-            "execution_mode": self.safety.execution_mode.value
-        }
+            "execution_mode": self.safety.execution_mode.value,
+            "background_tasks_count": len(self._background_tasks)  # FIX #2: Added
+                }
