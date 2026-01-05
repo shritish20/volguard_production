@@ -1,6 +1,8 @@
+# app/core/risk/capital_governor.py
+
 import asyncio
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from datetime import datetime, date
 import numpy as np
 from app.core.risk.schemas import MarginCheckResult
@@ -36,6 +38,19 @@ class MarginPredictor:
         # Keep only last 500 records
         if len(self.historical_data) > 500:
             self.historical_data = self.historical_data[-500:]
+            
+    def record_simple_margin(self, margin: float, lots: int):
+        """Fallback for when we only know total margin and lots (Legacy Supervisor support)"""
+        # We synthesize a generic entry so the predictor has *some* data
+        if lots <= 0: return
+        self.historical_data.append({
+            'margin_per_lot': margin / (lots * 50),
+            'moneyness': 1.0, # Assumed ATM
+            'dte': 7,         # Assumed Weekly
+            'iv': 0.15,
+            'side': 'SELL',   # Assume Sell as it dominates margin
+            'timestamp': datetime.now()
+        })
     
     def predict(self, strike: float, spot: float, dte: int, 
                 iv: float, side: str, qty: int) -> float:
@@ -73,10 +88,9 @@ class MarginPredictor:
             margins = [d['margin_per_lot'] for d in similar]
             margin_per_lot = np.mean(margins) * 1.20
         
-        lots = qty // 50
-        total_margin = margin_per_lot * lots * 1.10  # Add 10% safety buffer
+        lots = max(1, qty // 50)
+        total_margin = margin_per_lot * lots * 50 * 1.10  # Add 10% safety buffer
         
-        logger.debug(f"Predicted margin: ₹{total_margin:,.0f} based on {len(similar)} similar trades")
         return total_margin
     
     def _conservative_estimate(self, strike: float, spot: float, 
@@ -85,13 +99,13 @@ class MarginPredictor:
         Conservative margin estimates based on exchange guidelines.
         Used when no historical data available.
         """
-        lots = qty // 50
+        lots = max(1, qty // 50)
         
         if side == "BUY":
-            # Premium + 20% buffer
+            # Premium + 50% buffer (Updated from 20% for safety against Vega expansion)
             moneyness = abs(strike - spot) / spot
             estimated_premium = spot * 0.03 * (1 - moneyness)  # Rough estimate
-            return estimated_premium * qty * 1.20
+            return estimated_premium * qty * 1.50
         
         # SELL side - actual margin calculation
         moneyness = strike / spot
@@ -99,13 +113,13 @@ class MarginPredictor:
         # ATM/ITM options have higher margin
         if 0.95 <= moneyness <= 1.05:  # ATM ±5%
             if dte <= 2:  # Expiry week
-                margin_per_lot = 280000  # Conservative expiry margin
+                margin_per_lot = 280000.0  # Conservative expiry margin
             else:
-                margin_per_lot = 220000  # ATM normal margin
+                margin_per_lot = 220000.0  # ATM normal margin
         elif moneyness < 0.90 or moneyness > 1.10:  # Deep OTM
-            margin_per_lot = 150000
+            margin_per_lot = 150000.0
         else:  # Slightly OTM
-            margin_per_lot = 180000
+            margin_per_lot = 180000.0
         
         # Expiry day multiplier
         if dte == 0:
@@ -113,7 +127,6 @@ class MarginPredictor:
         
         total = margin_per_lot * lots * 1.15  # 15% safety buffer
         
-        logger.warning(f"Using conservative margin estimate: ₹{total:,.0f} (no historical data)")
         return total
 
 
@@ -135,46 +148,45 @@ class CapitalGovernor:
         """
         Get available funds from broker API
         """
-        # TODO: Implement actual API call
-        # For now, use simple calculation
+        # In a real impl, this calls the broker. 
+        # For now, we simulate based on Config + PnL
         return self.total_capital + self.daily_pnl
     
     async def predict_margin_requirement(self, legs: List[Dict]) -> float:
         """
         Call Broker Margin API or use ML predictor as fallback
         """
-        # TODO: Implement actual Upstox margin API call
-        # For now, using predictor
-        
         total_margin = 0.0
         
         for leg in legs:
-            strike = leg.get('strike', 0)
-            spot = leg.get('spot', 21500)  # Should come from market data
-            qty = leg.get('quantity', 0)
+            strike = leg.get('strike', 21500)
+            spot = leg.get('spot', 21500)  
+            qty = leg.get('quantity', 50)
             side = leg.get('side', 'BUY')
             
             # Calculate DTE
             expiry = leg.get('expiry')
+            dte = 7 # Default
             if expiry:
-                if isinstance(expiry, str):
-                    try:
+                try:
+                    if isinstance(expiry, str):
                         expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-                    except:
-                        expiry_date = date.today()
-                else:
-                    expiry_date = expiry.date() if hasattr(expiry, 'date') else expiry
-                
-                dte = (expiry_date - date.today()).days
-            else:
-                dte = 7  # Default assumption
+                    elif hasattr(expiry, 'date'):
+                        expiry_date = expiry.date()
+                    else:
+                        expiry_date = expiry
+                    
+                    if isinstance(expiry_date, date):
+                        dte = (expiry_date - date.today()).days
+                except:
+                    pass
             
             # Get IV from leg data or use default
             iv = leg.get('iv', 0.15)
             
             # Predict margin for this leg
             leg_margin = self.margin_predictor.predict(
-                strike, spot, dte, iv, side, qty
+                float(strike), float(spot), int(dte), float(iv), side, int(qty)
             )
             total_margin += leg_margin
         
@@ -202,9 +214,6 @@ class CapitalGovernor:
         except asyncio.TimeoutError:
             logger.error("Funds fetch timeout")
             return MarginCheckResult(False, "Cannot verify available funds (timeout)")
-        except Exception as e:
-            logger.error(f"Funds fetch failed: {e}")
-            return MarginCheckResult(False, f"Cannot verify available funds: {e}")
         
         # 3. Predict Margin - CRITICAL SECTION
         margin_source = "UNKNOWN"
@@ -214,116 +223,100 @@ class CapitalGovernor:
                 timeout=5.0
             )
             margin_source = "ML_PREDICTOR"
-            logger.info(f"Margin requirement: ₹{required_margin:,.0f} (source: {margin_source})")
             
         except asyncio.TimeoutError:
             logger.error("⚠ CRITICAL: Margin prediction timeout")
-            return MarginCheckResult(
-                allowed=False,
-                reason="Margin prediction timeout - cannot verify safety",
-                required_margin=0.0,
-                available_margin=available_funds
-            )
+            return MarginCheckResult(False, "Margin prediction timeout", 0.0, available_funds)
+            
         except Exception as e:
             logger.error(f"⚠ CRITICAL: Margin prediction failed: {e}")
             
             # Check environment
             current_env = str(settings.ENVIRONMENT).lower()
-            if hasattr(settings.ENVIRONMENT, 'value'):
-                current_env = str(settings.ENVIRONMENT.value).lower()
-            
-            if current_env in ['full_auto', 'production_live']:
-                logger.critical("🛑 BLOCKING TRADE: Margin prediction unavailable in FULL_AUTO mode")
-                return MarginCheckResult(
-                    allowed=False,
-                    reason="CRITICAL: Margin prediction unavailable in FULL_AUTO mode",
-                    required_margin=0.0,
-                    available_margin=available_funds
-                )
+            if 'full_auto' in current_env or 'production' in current_env:
+                logger.critical("🛑 BLOCKING TRADE: Margin prediction unavailable in FULL_AUTO")
+                return MarginCheckResult(False, "CRITICAL: Margin prediction failed", 0.0, available_funds)
             else:
-                logger.error("⚠ Using conservative estimate in non-production mode")
-                # Use most conservative estimate possible
-                required_margin = sum(
-                    self.margin_predictor._conservative_estimate(
-                        leg.get('strike', 21500),
-                        leg.get('spot', 21500),
-                        7,  # Conservative DTE
-                        leg.get('side', 'SELL'),
-                        leg.get('quantity', 50)
-                    ) for leg in legs
-                )
-                margin_source = "CONSERVATIVE_FALLBACK"
+                # Fallback for SHADOW mode
+                required_margin = 200000.0 * (len(legs)) # Rough fallback
+                margin_source = "EMERGENCY_FALLBACK"
         
-        # 4. Buffer: Keep 15% free always (increased from 10%)
-        safe_margin_limit = available_funds * 0.85  # Use max 85% of available funds
+        # 4. Buffer: Keep 15% free always
+        safe_margin_limit = available_funds * 0.85
         
         if required_margin > safe_margin_limit:
             self.failed_margin_calls += 1
             return MarginCheckResult(
                 allowed=False,
-                reason=f"Insufficient Margin (Req: ₹{required_margin:,.0f} | Avail: ₹{available_funds:,.0f} | Source: {margin_source})",
+                reason=f"Insufficient Margin (Req: ₹{required_margin:,.0f} | Limit: ₹{safe_margin_limit:,.0f})",
                 required_margin=required_margin,
                 available_margin=available_funds
             )
         
         # 5. Brokerage Check
-        est_brokerage = await self.estimate_brokerage(legs)
-        
-        # 6. Log margin source for audit trail
-        logger.info(f"✅ Margin check PASSED - Source: {margin_source}, Required: ₹{required_margin:,.0f}, Available: ₹{available_funds:,.0f}")
+        est_brokerage = len(legs) * 25.0
         
         return MarginCheckResult(
             allowed=True,
-            reason=f"OK (margin_source={margin_source})",
+            reason=f"OK (source={margin_source})",
             required_margin=required_margin,
             available_margin=available_funds,
             brokerage_estimate=est_brokerage
         )
     
-    async def estimate_brokerage(self, legs: List[Dict]) -> float:
-        """Estimate brokerage charges (approx ₹20 per order + taxes)"""
-        num_orders = len(legs)
-        return num_orders * 25.0  # Conservative estimate
-    
-    def record_actual_margin(self, required_margin: float, legs: List[Dict]):
+    def record_actual_margin(self, arg1, arg2):
         """
-        Record actual margin after successful execution.
-        This trains the margin predictor.
+        Hybrid method to handle calls from both Supervisor (legacy) and Executor (detailed).
+        Supervisor calls: record_actual_margin(margin: float, lots: int)
+        Executor calls:   record_actual_margin(margin: float, legs: List[Dict])
         """
+        try:
+            margin = float(arg1)
+            
+            if isinstance(arg2, int):
+                # Called by Supervisor with 'lots'
+                self.margin_predictor.record_simple_margin(margin, arg2)
+            elif isinstance(arg2, list):
+                # Called by Executor with 'legs'
+                self._record_detailed(margin, arg2)
+            else:
+                logger.warning(f"Unknown arguments for record_actual_margin: {type(arg2)}")
+                
+        except Exception as e:
+            logger.error(f"Failed to record margin: {e}")
+
+    def _record_detailed(self, required_margin: float, legs: List[Dict]):
+        """Internal helper for detailed recording"""
         for leg in legs:
             strike = leg.get('strike', 0)
             spot = leg.get('spot', 21500)
             qty = leg.get('quantity', 0)
             side = leg.get('side', 'BUY')
-            
-            # Calculate DTE
-            expiry = leg.get('expiry')
-            if expiry:
-                if isinstance(expiry, str):
-                    try:
-                        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-                    except:
-                        expiry_date = date.today()
-                else:
-                    expiry_date = expiry.date() if hasattr(expiry, 'date') else expiry
-                
-                dte = (expiry_date - date.today()).days
-            else:
-                dte = 7
-            
             iv = leg.get('iv', 0.15)
             
-            # Record for this leg
+            # Calculate DTE
+            dte = 7
+            expiry = leg.get('expiry')
+            if expiry:
+                 try:
+                    if isinstance(expiry, str):
+                        ed = datetime.strptime(expiry, "%Y-%m-%d").date()
+                    elif hasattr(expiry, 'date'):
+                        ed = expiry.date()
+                    else:
+                        ed = expiry
+                    if isinstance(ed, date):
+                        dte = (ed - date.today()).days
+                 except: pass
+
             self.margin_predictor.record_actual_margin(
-                margin=required_margin / len(legs),  # Split margin across legs
-                strike=strike,
-                spot=spot,
-                dte=dte,
-                iv=iv,
+                margin=required_margin / max(1, len(legs)),
+                strike=float(strike),
+                spot=float(spot),
+                dte=int(dte),
+                iv=float(iv),
                 side=side
             )
-        
-        logger.info(f"📊 Recorded actual margin for {len(legs)} legs")
     
     def update_pnl(self, realized_pnl: float):
         """Update daily PnL"""
@@ -332,22 +325,3 @@ class CapitalGovernor:
     def update_position_count(self, count: int):
         """Update position count"""
         self.position_count = count
-    
-    # Backward compatibility method for supervisor
-    def record_actual_margin_legacy(self, required_margin: float, num_lots: int):
-        """
-        Legacy method for backward compatibility with supervisor.
-        Converts to new legs format.
-        """
-        logger.warning(f"Using legacy margin recording method: {required_margin} for {num_lots} lots")
-        # Create dummy leg structure for backward compatibility
-        dummy_legs = [{
-            'strike': 21500,
-            'spot': 21500,
-            'quantity': num_lots * 50,
-            'side': 'SELL',  # Most conservative assumption
-            'expiry': date.today().isoformat(),
-            'iv': 0.15
-        }]
-        
-        self.record_actual_margin(required_margin, dummy_legs)
