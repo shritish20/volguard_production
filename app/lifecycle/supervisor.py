@@ -55,6 +55,7 @@ class ProductionTradingSupervisor:
     ✅ Smart scheduling (weekend/night sleep, daily data ritual)
     ✅ Comprehensive error handling and monitoring
     ✅ Background task management with proper cleanup
+    ✅ Enhanced WebSocket integration with health checks
     """
 
     def __init__(
@@ -99,7 +100,7 @@ class ProductionTradingSupervisor:
         # Smart Data Cache
         self.daily_data = pd.DataFrame()
         self.intraday_data = pd.DataFrame()
-        self.last_heavy_refresh_date = None  # NEW: Daily refresh tracking
+        self.last_heavy_refresh_date = None
 
         # Timers
         self.last_daily_fetch = 0.0
@@ -369,6 +370,19 @@ class ProductionTradingSupervisor:
                         adjustments.extend(new_entries)
 
             cycle_log["adjustments_count"] = len(adjustments)
+            
+            # ENHANCED: Add WebSocket diagnostics to cycle log
+            if self.ws:
+                try:
+                    ws_stats = self.ws.get_stats()
+                    cycle_log["ws_stats"] = {
+                        "healthy": ws_stats["is_healthy"],
+                        "messages_received": ws_stats["messages_received"],
+                        "cached_instruments": ws_stats["cached_instruments"],
+                        "data_age_seconds": ws_stats["data_age_seconds"]
+                    }
+                except Exception as e:
+                    logger.debug(f"Failed to get WebSocket stats: {e}")
 
             # 7. EXECUTION
             execution_results = []
@@ -458,7 +472,10 @@ class ProductionTradingSupervisor:
                 logger.error(f"Capital state update failed: {e}")
 
     async def _read_live_snapshot(self) -> Dict:
-        """Read live market snapshot with timeout protection"""
+        """
+        Read live market snapshot with timeout protection
+        ENHANCED: Uses robust WebSocket health check
+        """
         try:
             quotes_task = asyncio.create_task(
                 self.market.get_live_quote([NIFTY_KEY, VIX_KEY])
@@ -471,17 +488,31 @@ class ProductionTradingSupervisor:
             logger.error(f"Market data fetch failed: {e}")
             quotes = {NIFTY_KEY: 0.0, VIX_KEY: 0.0}
 
-        # WebSocket Greeks with validation
+        # ENHANCED: WebSocket Greeks with robust health validation
         greeks = {}
         ws_healthy = False
         if self.ws:
             try:
-                if self.ws.is_connected:
+                # Use robust health check (checks connection + data freshness)
+                if self.ws.is_healthy():
                     ws_healthy = True
                     raw_greeks = self.ws.get_latest_greeks()
+                    
+                    # Validate each Greeks entry
                     for key, val in raw_greeks.items():
-                        if isinstance(val, dict):
+                        if isinstance(val, dict) and val:  # Ensure not empty
                             greeks[key] = val
+                    
+                    # Diagnostic: Warn if WebSocket is healthy but no Greeks
+                    if len(greeks) == 0 and len(raw_greeks) > 0:
+                        logger.warning("WebSocket returned data but no valid Greeks")
+                else:
+                    # Diagnostic logging for unhealthy WebSocket
+                    if self.ws.is_connected:
+                        logger.debug("WebSocket connected but data is stale (>30s old)")
+                    else:
+                        logger.debug("WebSocket not connected")
+                        
             except Exception as e:
                 logger.debug(f"WebSocket Greeks fetch failed: {e}")
 
@@ -642,7 +673,7 @@ class ProductionTradingSupervisor:
                 if result.get("status") == "PLACED":
                     logger.info(f"[{cycle_id}] ✅ Order placed: {result.get('order_id')}")
                     
-                    # CRITICAL: Learn actual margin (FIX #1)
+                    # CRITICAL: Learn actual margin
                     if "required_margin" in result:
                         self.cap_governor.record_actual_margin(
                             result["required_margin"],
@@ -770,7 +801,7 @@ class ProductionTradingSupervisor:
 
     def get_performance_metrics(self) -> Dict:
         """Get current performance metrics"""
-        return {
+        metrics = {
             "avg_cycle_time": self.avg_cycle_time,
             "cycle_count": len(self.cycle_times),
             "consecutive_data_failures": self.consecutive_data_failures,
@@ -782,6 +813,23 @@ class ProductionTradingSupervisor:
             "last_heavy_refresh": self.last_heavy_refresh_date,
             "portfolio_delta": self._calc_net_delta() if self.positions else 0.0
         }
+        
+        # Add WebSocket stats if available
+        if self.ws:
+            try:
+                ws_stats = self.ws.get_stats()
+                metrics["websocket"] = {
+                    "connected": ws_stats["is_connected"],
+                    "healthy": ws_stats["is_healthy"],
+                    "messages_received": ws_stats["messages_received"],
+                    "reconnect_attempts": ws_stats["reconnect_attempts"],
+                    "cached_instruments": ws_stats["cached_instruments"],
+                    "data_age_seconds": ws_stats["data_age_seconds"]
+                }
+            except Exception as e:
+                logger.debug(f"Failed to get WebSocket stats in metrics: {e}")
+        
+        return metrics
 
     async def stop(self):
         """Graceful shutdown"""
