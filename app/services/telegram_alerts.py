@@ -1,5 +1,7 @@
 """
 Telegram Alert Service - Sends critical alerts to Telegram
+
+FIX #10: Emergency alerts bypass rate limiting for critical system events.
 """
 import logging
 import asyncio
@@ -14,6 +16,8 @@ class TelegramAlertService:
     """
     Sends critical system alerts to Telegram.
     Prioritizes critical events and includes actionable information.
+    
+    FIX #10: EMERGENCY and CRITICAL alerts NEVER rate limited.
     """
     
     def __init__(self):
@@ -22,7 +26,7 @@ class TelegramAlertService:
         self.enabled = bool(self.bot_token and self.chat_id)
         self.client = httpx.AsyncClient(timeout=10.0)
         self.alert_history: List[Dict] = []
-        self.max_history = 100
+        self.max_history = 200  # Increased for better monitoring
         
         if self.enabled:
             logger.info("Telegram alerts ENABLED")
@@ -36,14 +40,14 @@ class TelegramAlertService:
                          data: Optional[Dict] = None,
                          include_timestamp: bool = True) -> bool:
         """
-        Send alert to Telegram.
+        Send alert to Telegram with priority handling.
         Returns True if successful, False otherwise.
         
         Severity levels:
         - INFO: Normal operations (green)
         - WARNING: Attention needed (yellow) 
         - CRITICAL: Immediate action (red)
-        - EMERGENCY: System failure (red with 🔴)
+        - EMERGENCY: System failure (red with 🔴) - NEVER rate limited
         - TRADE: Trade execution (blue)
         """
         
@@ -67,12 +71,16 @@ class TelegramAlertService:
         if not self.enabled:
             return False
         
-        # Rate limiting: Don't spam Telegram
+        # Rate limiting check (EMERGENCY/CRITICAL bypass automatically)
         if self._should_rate_limit(severity):
             logger.debug(f"Rate limiting Telegram alert: {title}")
             return False
         
         try:
+            # ✅ FIX #10: For EMERGENCY, add attention-grabbing formatting
+            if severity == "EMERGENCY":
+                message = f"🚨🚨🚨 EMERGENCY 🚨🚨🚨\n\n{message}\n\n⚠️ IMMEDIATE ACTION REQUIRED"
+            
             # Format message with Markdown
             formatted_msg = self._format_message(
                 title=title,
@@ -82,8 +90,17 @@ class TelegramAlertService:
                 include_timestamp=include_timestamp
             )
             
-            # Send to Telegram
-            success = await self._send_telegram_message(formatted_msg)
+            # ✅ FIX #10: For critical alerts, try multiple times
+            max_retries = 3 if severity in ["EMERGENCY", "CRITICAL"] else 1
+            
+            success = False
+            for attempt in range(max_retries):
+                success = await self._send_telegram_message(formatted_msg)
+                
+                if success:
+                    break
+                elif attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
             
             # Store in history
             self._store_alert({
@@ -99,6 +116,34 @@ class TelegramAlertService:
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")
             return False
+    
+    def _should_rate_limit(self, severity: str) -> bool:
+        """
+        Prevent alert spam with EMERGENCY bypass.
+        
+        ✅ FIX #10: EMERGENCY and CRITICAL alerts NEVER rate limited.
+        """
+        
+        # ✅ FIX: NEVER rate limit critical alerts
+        if severity in ["EMERGENCY", "CRITICAL"]:
+            return False
+        
+        # Rate limit other severities
+        now = datetime.now()
+        recent_alerts = [
+            alert for alert in self.alert_history[-20:]  # Check last 20 (increased from 10)
+            if (now - alert["timestamp"]).total_seconds() < 300  # 5 minutes
+        ]
+        
+        # Different limits by severity
+        if severity == "WARNING":
+            max_alerts = 15  # Allow more warnings
+        elif severity == "TRADE":
+            max_alerts = 20  # Allow many trade alerts
+        else:  # INFO, SUCCESS
+            max_alerts = 10
+        
+        return len(recent_alerts) >= max_alerts
     
     async def _send_telegram_message(self, message: str) -> bool:
         """Send formatted message to Telegram"""
@@ -178,22 +223,6 @@ class TelegramAlertService:
         lines.append("#VolGuard")
         
         return "\n".join(lines)
-    
-    def _should_rate_limit(self, severity: str) -> bool:
-        """Prevent alert spam"""
-        # Never rate limit emergencies
-        if severity in ["EMERGENCY", "CRITICAL"]:
-            return False
-        
-        # Check last 5 minutes of alerts
-        now = datetime.now()
-        recent_alerts = [
-            alert for alert in self.alert_history[-10:]
-            if (now - alert["timestamp"]).total_seconds() < 300  # 5 minutes
-        ]
-        
-        # Max 10 alerts in 5 minutes for non-critical
-        return len(recent_alerts) >= 10
     
     def _store_alert(self, alert: Dict):
         """Store alert in history (circular buffer)"""
@@ -303,6 +332,64 @@ class TelegramAlertService:
                 "avg_cycle_time": round(cycle_time, 2),
                 "data_quality": round(data_quality, 2),
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+        )
+    
+    async def send_greeks_failure_alert(self, 
+                                      missing_count: int, 
+                                      total_positions: int,
+                                      instrument_keys: List[str]) -> bool:
+        """Alert for Greek calculation failures"""
+        percent_failed = (missing_count / total_positions * 100) if total_positions > 0 else 0
+        
+        return await self.send_alert(
+            title="GREEKS CALCULATION FAILURE",
+            message=f"⚠️ {missing_count}/{total_positions} positions ({percent_failed:.1f}%) have unreliable Greeks",
+            severity="CRITICAL",
+            data={
+                "missing_greeks_count": missing_count,
+                "total_positions": total_positions,
+                "failure_percentage": round(percent_failed, 2),
+                "affected_instruments": instrument_keys[:5],  # First 5 only
+                "action": "HALTED_OR_DEGRADED_MODE"
+            }
+        )
+    
+    async def send_redis_failure_alert(self, 
+                                      component: str,
+                                      error: str,
+                                      impact: str) -> bool:
+        """Alert for Redis failures"""
+        return await self.send_alert(
+            title=f"REDIS FAILURE - {component}",
+            message=f"Redis connection failed for {component}\nImpact: {impact}\nError: {error[:100]}",
+            severity="CRITICAL",
+            data={
+                "component": component,
+                "error": error[:200],  # Truncate long errors
+                "impact": impact,
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+    
+    async def send_websocket_reconnect_alert(self, 
+                                           attempt: int,
+                                           max_attempts: int,
+                                           delay: float,
+                                           last_success: Optional[datetime]) -> bool:
+        """Alert for WebSocket reconnection attempts"""
+        last_success_str = last_success.strftime("%H:%M:%S") if last_success else "Never"
+        
+        return await self.send_alert(
+            title="WEBSOCKET RECONNECTION",
+            message=f"Attempt {attempt}/{max_attempts} in {delay:.0f}s\nLast success: {last_success_str}",
+            severity="WARNING",
+            data={
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_seconds": delay,
+                "last_success": last_success_str,
+                "timestamp": datetime.now().isoformat()
             }
         )
     
