@@ -2,6 +2,7 @@
 Telegram Alert Service - Sends critical alerts to Telegram
 
 FIX #10: Emergency alerts bypass rate limiting for critical system events.
+ENHANCED: Added market hours alerts, WebSocket success, and daily summaries.
 """
 import logging
 import asyncio
@@ -49,6 +50,7 @@ class TelegramAlertService:
         - CRITICAL: Immediate action (red)
         - EMERGENCY: System failure (red with 🔴) - NEVER rate limited
         - TRADE: Trade execution (blue)
+        - SUCCESS: Positive events (green)
         """
         
         # Log to file regardless
@@ -182,7 +184,8 @@ class TelegramAlertService:
             "WARNING": "⚠️",
             "CRITICAL": "🔴",
             "EMERGENCY": "🆘",
-            "TRADE": "💰"
+            "TRADE": "💰",
+            "SUCCESS": "✅"
         }
         
         emoji = emoji_map.get(severity, "📝")
@@ -225,10 +228,11 @@ class TelegramAlertService:
         return "\n".join(lines)
     
     def _store_alert(self, alert: Dict):
-        """Store alert in history (circular buffer)"""
+        """Store alert in history (circular buffer) - OPTIMIZED"""
         self.alert_history.append(alert)
         if len(self.alert_history) > self.max_history:
-            self.alert_history.pop(0)
+            # ✅ OPTIMIZED: More efficient than pop(0)
+            self.alert_history = self.alert_history[-self.max_history:]
     
     async def send_test_alert(self) -> bool:
         """Send test alert to verify Telegram setup"""
@@ -390,6 +394,81 @@ class TelegramAlertService:
                 "delay_seconds": delay,
                 "last_success": last_success_str,
                 "timestamp": datetime.now().isoformat()
+            }
+        )
+    
+    # ========================================
+    # ✨ NEW ENHANCED ALERTS
+    # ========================================
+    
+    async def send_websocket_connected_alert(self, instruments_count: int) -> bool:
+        """Alert when WebSocket successfully connects (NEW)"""
+        return await self.send_alert(
+            title="✅ WEBSOCKET CONNECTED",
+            message=f"Live market data feed established\nSubscribed to {instruments_count} instruments",
+            severity="SUCCESS",
+            data={
+                "instruments_count": instruments_count,
+                "mode": "full",
+                "features": ["Live Quotes", "Greeks", "Depth"],
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+    
+    async def send_market_hours_alert(self, event: str) -> bool:
+        """Alert for market open/close events (NEW)"""
+        emoji = "🔔" if event == "OPEN" else "🌙"
+        message = f"NSE Market is now *{event}*"
+        
+        if event == "OPEN":
+            message += "\n\n✅ Trading system active"
+        else:
+            message += "\n\n💤 Trading system hibernating"
+        
+        return await self.send_alert(
+            title=f"{emoji} Market {event}",
+            message=message,
+            severity="INFO",
+            data={
+                "event": event,
+                "timestamp": datetime.now().strftime("%H:%M:%S IST"),
+                "trading_hours": "09:15 - 15:30" if event == "OPEN" else "Closed"
+            }
+        )
+    
+    async def send_daily_summary(self, stats: Dict) -> bool:
+        """Send end-of-day trading summary (NEW)"""
+        pnl = stats.get('pnl', 0)
+        pnl_emoji = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
+        
+        return await self.send_alert(
+            title=f"📊 Daily Trading Summary {pnl_emoji}",
+            message=f"Trades: {stats.get('trades', 0)}\nPnL: ₹{pnl:,.0f}\nWin Rate: {stats.get('win_rate', 0):.1f}%",
+            severity="INFO",
+            data={
+                "total_trades": stats.get('trades', 0),
+                "winning_trades": stats.get('wins', 0),
+                "losing_trades": stats.get('losses', 0),
+                "daily_pnl": pnl,
+                "win_rate": stats.get('win_rate', 0),
+                "max_drawdown": stats.get('max_dd', 0),
+                "largest_win": stats.get('largest_win', 0),
+                "largest_loss": stats.get('largest_loss', 0)
+            }
+        )
+    
+    async def send_deployment_alert(self, environment: str) -> bool:
+        """Alert when system starts (NEW)"""
+        emoji = "🚀" if environment == "shadow" else "⚠️"
+        
+        return await self.send_alert(
+            title=f"{emoji} VolGuard Deployed",
+            message=f"System started in *{environment.upper()}* mode\n\nMonitoring active",
+            severity="INFO",
+            data={
+                "environment": environment,
+                "deployment_time": datetime.now().isoformat(),
+                "version": "3.1.0"
             }
         )
     
