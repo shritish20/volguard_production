@@ -1,7 +1,8 @@
-# app/utils/metrics.py
 """
 PRODUCTION-READY Metrics System for VolGuard
 Exports comprehensive Prometheus metrics for monitoring and alerting.
+
+FIX #9: Reduced label cardinality by separating metrics into logical groups.
 """
 import time
 import platform
@@ -19,20 +20,32 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # ============================================
-# 1. CORE TRADING METRICS
+# 1. CORE TRADING METRICS (FIXED CARDINALITY)
 # ============================================
 
-# Order execution
+# Order execution - REDUCED CARDINALITY
 orders_placed_total = Counter(
     'volguard_orders_placed_total',
     'Total orders placed by the system',
-    ['side', 'strategy', 'instrument_type', 'order_type', 'status']
+    ['side', 'status']  # ✅ Only 2 labels: 2 sides × 5 statuses = 10 series
+)
+
+orders_by_strategy = Counter(
+    'volguard_orders_by_strategy_total',
+    'Orders grouped by strategy',
+    ['strategy']  # ✅ Separate metric for strategy tracking
+)
+
+orders_by_type = Counter(
+    'volguard_orders_by_type_total',
+    'Orders grouped by instrument type',
+    ['instrument_type', 'order_type']  # ✅ Separate metric: 3 × 2 = 6 series
 )
 
 orders_failed_total = Counter(
     'volguard_orders_failed_total',
     'Total order failures',
-    ['failure_reason', 'phase', 'instrument_type']
+    ['failure_reason']  # ✅ Simplified from 3 labels to 1
 )
 
 order_execution_duration = Histogram(
@@ -42,35 +55,32 @@ order_execution_duration = Histogram(
     labelnames=['order_type', 'side']
 )
 
-# Position metrics
-active_positions = Gauge(
-    'volguard_active_positions',
-    'Current number of active positions',
-    ['strategy', 'instrument_type']
+# Position metrics - AGGREGATED FOR LOW CARDINALITY
+active_positions_aggregate = Gauge(
+    'volguard_active_positions_aggregate',
+    'Current number of active positions'
 )
 
-position_pnl = Gauge(
-    'volguard_position_pnl',
-    'Current PnL of active positions',
-    ['strategy', 'instrument_type']
+position_delta_aggregate = Gauge(
+    'volguard_position_delta_aggregate',
+    'Aggregate portfolio delta'
 )
 
-position_delta = Gauge(
-    'volguard_position_delta',
-    'Current delta of active positions',
-    ['strategy']
+position_delta_by_strategy = Gauge(
+    'volguard_position_delta_by_strategy',
+    'Delta by strategy',
+    ['strategy']  # ✅ Separate metric for strategy breakdown
 )
 
-position_vega = Gauge(
-    'volguard_position_vega',
-    'Current vega of active positions',
-    ['strategy']
+position_pnl_aggregate = Gauge(
+    'volguard_position_pnl_aggregate',
+    'Current PnL of active positions'
 )
 
-position_theta = Gauge(
-    'volguard_position_theta',
-    'Current theta of active positions',
-    ['strategy']
+position_greeks_aggregate = Gauge(
+    'volguard_position_greeks_aggregate',
+    'Aggregate Greek exposures',
+    ['greek']  # ✅ One label for all Greeks
 )
 
 # Capital metrics
@@ -165,8 +175,7 @@ vix_value = Gauge(
 
 option_chain_quality = Gauge(
     'volguard_option_chain_quality',
-    'Quality of option chain data (0-1)',
-    ['expiry']
+    'Quality of option chain data (0-1)'
 )
 
 # ============================================
@@ -382,28 +391,29 @@ class MetricsCollector:
         logger.info(f"Metrics system initialized for {environment} v{version}")
     
     def record_order(self, order: OrderMetrics, status: str, error: Optional[str] = None):
-        """Record an order execution"""
+        """Record an order execution with proper cardinality management"""
         if not self._initialized:
             logger.warning("Metrics not initialized")
             return
         
         self.orders.append(order)
         
-        # Increment counters
+        # ✅ FIX #9: Record order with separate metrics
+        # Main metric: Just side and status (low cardinality)
         orders_placed_total.labels(
             side=order.side,
-            strategy=order.strategy,
-            instrument_type=order.instrument_type,
-            order_type=order.order_type,
             status=status
         ).inc()
         
+        # Separate detailed metrics
+        orders_by_strategy.labels(strategy=order.strategy).inc()
+        orders_by_type.labels(
+            instrument_type=order.instrument_type,
+            order_type=order.order_type
+        ).inc()
+        
         if error:
-            orders_failed_total.labels(
-                failure_reason=error,
-                phase='execution',
-                instrument_type=order.instrument_type
-            ).inc()
+            orders_failed_total.labels(failure_reason=error).inc()
     
     def record_cycle(self, cycle: CycleMetrics):
         """Record a supervisor cycle"""
@@ -423,8 +433,8 @@ class MetricsCollector:
         # Update data quality
         market_data_quality.set(cycle.data_quality)
         
-        # Update position count
-        active_positions.labels(strategy='all', instrument_type='all').set(cycle.positions_count)
+        # Update position count (aggregated)
+        active_positions_aggregate.set(cycle.positions_count)
     
     def update_portfolio_metrics(self, positions: list, pnl: float, margin: float):
         """Update portfolio metrics - ALIAS for backward compatibility"""
@@ -443,8 +453,20 @@ class MetricsCollector:
         available_margin.set(margin)
         daily_pnl.set(pnl)
         
-        # Update position metrics
-        active_positions.labels(strategy='all', instrument_type='all').set(positions_count)
+        # Update position metrics (aggregated)
+        active_positions_aggregate.set(positions_count)
+    
+    def update_portfolio_delta(self, total_delta: float, deltas_by_strategy: Dict[str, float]):
+        """Update delta metrics with reduced cardinality"""
+        if not self._initialized:
+            return
+        
+        # Set aggregate delta
+        position_delta_aggregate.set(total_delta)
+        
+        # Set strategy-specific deltas (separate metric)
+        for strategy, delta in deltas_by_strategy.items():
+            position_delta_by_strategy.labels(strategy=strategy).set(delta)
     
     def update_system_state(self, state: str, mode: str):
         """Update system state"""
@@ -585,7 +607,7 @@ def measure_duration(metric: Histogram, **labels):
         metric.labels(**labels).observe(duration)
 
 # ============================================
-# CONVENIENCE FUNCTIONS
+# CONVENIENCE FUNCTIONS (UPDATED FOR FIX #9)
 # ============================================
 
 # Global metrics collector instance
@@ -593,23 +615,26 @@ collector = MetricsCollector()
 
 def record_order_placed(side: str, strategy: str, instrument_type: str = "OPTION", 
                        order_type: str = "MARKET", status: str = 'PLACED'):
-    """Convenience function to record order placement"""
+    """
+    Record order placement with proper cardinality management
+    """
+    # Main metric: Just side and status (low cardinality)
     orders_placed_total.labels(
         side=side,
-        strategy=strategy,
-        instrument_type=instrument_type,
-        order_type=order_type,
         status=status
+    ).inc()
+    
+    # Separate detailed metrics
+    orders_by_strategy.labels(strategy=strategy).inc()
+    orders_by_type.labels(
+        instrument_type=instrument_type,
+        order_type=order_type
     ).inc()
 
 def record_order_failed(failure_reason: str, phase: str = 'execution', 
                        instrument_type: str = 'OPTION'):
     """Convenience function to record order failure"""
-    orders_failed_total.labels(
-        failure_reason=failure_reason,
-        phase=phase,
-        instrument_type=instrument_type
-    ).inc()
+    orders_failed_total.labels(failure_reason=failure_reason).inc()
 
 def update_portfolio_metrics(positions: list, pnl: float, margin: float):
     """Convenience function to update portfolio metrics - ALIAS for backward compatibility"""
@@ -618,7 +643,7 @@ def update_portfolio_metrics(positions: list, pnl: float, margin: float):
 
 def update_portfolio_metrics_simple(positions_count: int, pnl: float, margin: float):
     """Simple portfolio metrics update"""
-    active_positions.labels(strategy='all', instrument_type='all').set(positions_count)
+    active_positions_aggregate.set(positions_count)
     daily_pnl.set(pnl)
     available_margin.set(margin)
     
@@ -638,6 +663,13 @@ def set_system_state(state: str):
     """Set system state"""
     system_state.state(state)
 
+def update_portfolio_delta(total_delta: float, deltas_by_strategy: Dict[str, float]):
+    """Update delta metrics with reduced cardinality"""
+    position_delta_aggregate.set(total_delta)
+    
+    for strategy, delta in deltas_by_strategy.items():
+        position_delta_by_strategy.labels(strategy=strategy).set(delta)
+
 def update_data_quality(quality_score: float):
     """Update data quality metric"""
     market_data_quality.set(quality_score)
@@ -653,12 +685,16 @@ def update_component_health(component: str, healthy: bool):
 # Alias for backward compatibility
 cycle_duration = supervisor_cycle_duration
 
-# Aliases for metric objects used in supervisor
-net_delta = position_delta
+# ✅ FIX #9: Updated aliases with new aggregate metrics
+net_delta = position_delta_aggregate
 data_quality_score = market_data_quality
 orders_placed = orders_placed_total
 orders_failed = orders_failed_total
 safety_violations = risk_limit_breaches
+
+# For supervisor compatibility - maintain old function names
+active_positions = active_positions_aggregate
+position_pnl = position_pnl_aggregate
 
 # Simple aliases for functions
 set_system_state_simple = set_system_state
