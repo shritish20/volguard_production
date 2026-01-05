@@ -22,6 +22,15 @@ services:
       timeout: 5s
       retries: 5
     restart: always
+    # ✅ OPTIMIZATION: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
 
   # ---
   # 2. CACHE & STATE (Redis 7) - CRITICAL FOR EXECUTOR
@@ -40,25 +49,63 @@ services:
       timeout: 5s
       retries: 3
     restart: always
+    # ✅ OPTIMIZATION: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
 
-  # ......
+  # ---
   # 3. TRADING SUPERVISOR (The Brain)
-  # ......
+  # ---
   supervisor:
     build: .
     container_name: volguard_supervisor
     environment:
+      # Database
       - POSTGRES_SERVER=postgres
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      
+      # Redis
       - REDIS_URL=redis://redis:6379/0
+      
+      # Timezone
       - TZ=Asia/Kolkata
-      - POSTGRES_USER
-      - POSTGRES_PASSWORD
-      - POSTGRES_DB
-      - UPSTOX_ACCESS_TOKEN
-      - ENVIRONMENT
-      - BASE_CAPITAL
-      - MAX_DAILY_LOSS
-      - SUPERVISOR_LOOP_INTERVAL
+      
+      # Upstox API - ✅ CRITICAL FIX: Added missing variables
+      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
+      - UPSTOX_REFRESH_TOKEN=${UPSTOX_REFRESH_TOKEN}
+      - UPSTOX_CLIENT_ID=${UPSTOX_CLIENT_ID}
+      - UPSTOX_CLIENT_SECRET=${UPSTOX_CLIENT_SECRET}
+      - UPSTOX_BASE_V2=${UPSTOX_BASE_V2}
+      - UPSTOX_BASE_V3=${UPSTOX_BASE_V3}
+      
+      # System Config
+      - ENVIRONMENT=${ENVIRONMENT}
+      - PROJECT_NAME=${PROJECT_NAME}
+      - VERSION=${VERSION}
+      
+      # Risk Limits - ✅ CRITICAL FIX: Added MAX_PORTFOLIO_LOSS
+      - BASE_CAPITAL=${BASE_CAPITAL}
+      - MAX_DAILY_LOSS=${MAX_DAILY_LOSS}
+      - MAX_PORTFOLIO_LOSS=${MAX_PORTFOLIO_LOSS}
+      - MAX_POSITIONS=${MAX_POSITIONS}
+      
+      # Supervisor Config - ✅ CRITICAL FIX: Added WebSocket flag
+      - SUPERVISOR_LOOP_INTERVAL=${SUPERVISOR_LOOP_INTERVAL}
+      - SUPERVISOR_WEBSOCKET_ENABLED=${SUPERVISOR_WEBSOCKET_ENABLED}
+      
+      # Alerts (Optional)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ADMIN_SECRET=${ADMIN_SECRET}
+      
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,7 +114,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./journal:/app/journal
-      - ./state:/app/state  # 🔴 CRITICAL FIX #4: Persists Kill Switch State
+      - ./state:/app/state  # Kill Switch State
     command: python run_supervisor.py
     restart: unless-stopped
     healthcheck:
@@ -76,31 +123,77 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    # ✅ OPTIMIZATION: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '1.0'
 
-  # ......
+  # ---
   # 4. API DASHBOARD (The Interface)
-  # ......
+  # ---
   api:
     build: .
     container_name: volguard_api
     ports:
       - "8000:8000"
     environment:
+      # Database
       - POSTGRES_SERVER=postgres
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      
+      # Redis
       - REDIS_URL=redis://redis:6379/0
+      
+      # Timezone
       - TZ=Asia/Kolkata
-      - POSTGRES_USER
-      - POSTGRES_PASSWORD
-      - POSTGRES_DB
-      - UPSTOX_ACCESS_TOKEN
+      
+      # Upstox API - ✅ CRITICAL FIX: Added missing variables
+      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
+      - UPSTOX_REFRESH_TOKEN=${UPSTOX_REFRESH_TOKEN}
+      - UPSTOX_CLIENT_ID=${UPSTOX_CLIENT_ID}
+      - UPSTOX_CLIENT_SECRET=${UPSTOX_CLIENT_SECRET}
+      - UPSTOX_BASE_V2=${UPSTOX_BASE_V2}
+      - UPSTOX_BASE_V3=${UPSTOX_BASE_V3}
+      
+      # System Config
+      - ENVIRONMENT=${ENVIRONMENT}
+      - ADMIN_SECRET=${ADMIN_SECRET}
+      
+      # Alerts (Optional)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      
     depends_on:
       - postgres
       - redis
     volumes:
       - ./logs:/app/logs
-      - ./state:/app/state  # 🔴 CRITICAL FIX #4: Allows API to write Kill Switch
+      - ./state:/app/state  # Kill Switch State
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     restart: always
+    # ✅ OPTIMIZATION: Added health check
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # ✅ OPTIMIZATION: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
 
 volumes:
   postgres_data:
