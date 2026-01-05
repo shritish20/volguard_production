@@ -41,17 +41,9 @@ class VolatilityEngine:
         Main computation entry point.
         """
         # 1. Fallback Checks
-        # If live spot/vix are missing, try to use the last close from history
         if spot_live <= 0 and not daily_data.empty:
             spot_live = daily_data.iloc[-1]["close"]
         
-        if vix_live <= 0 and not daily_data.empty:
-            # Look for a VIX column if it was passed, otherwise default logic
-            # Assuming daily_data passed here is NIFTY. 
-            # If VIX history is needed for IVP, it should be passed separately or handled upstream.
-            # For this engine, we focus on Realized Vol of the Index.
-            pass 
-
         is_fallback = (spot_live <= 0)
 
         # 2. Merge Data (The Hybrid Logic)
@@ -62,7 +54,6 @@ class VolatilityEngine:
             return self._get_default_metrics(spot_live, vix_live)
 
         # 3. Calculate Returns (Log Returns)
-        # Handle zeros safely
         close_series = full_series["close"].replace(0, np.nan).dropna()
         returns = np.log(close_series / close_series.shift(1)).dropna()
 
@@ -88,9 +79,8 @@ class VolatilityEngine:
         pk7 = np.sqrt(const_factor * hl_ratio_sq.tail(7).mean()) * np.sqrt(252) * 100
         pk28 = np.sqrt(const_factor * hl_ratio_sq.tail(28).mean()) * np.sqrt(252) * 100
 
-        # C. Vol of Vol (Based on VIX moves if available, or RV variance)
-        # For now, we use a placeholder or derived metric
-        vov = 0.0 # Requires VIX history series passed explicitly, simplified here
+        # C. Vol of Vol (Placeholder)
+        vov = 0.0
 
         # 5. HEAVY Calculations (GARCH - Run conditionally)
         # -------------------------------------------------
@@ -102,7 +92,6 @@ class VolatilityEngine:
             self._cached_garch7 = ga7
             self._cached_garch28 = ga28
             self._last_garch_time = time.time()
-            # logger.info(f"Recalculated GARCH: {ga7:.2f} / {ga28:.2f}")
         else:
             # Use Cache
             ga7 = self._cached_garch7
@@ -113,9 +102,7 @@ class VolatilityEngine:
         if np.isnan(ga28): ga28 = rv28
 
         # 6. IV Percentile (Rank)
-        # We need VIX history for this. If not passed, we can't calc accurately.
-        # Assuming upstream handles IVP or we calculate "Realized Vol Percentile" here.
-        # Let's calc RV Percentile as a proxy for internal regime
+        # Note: Using RV percentile as proxy if VIX history not available
         ivp30 = (returns.rolling(30).std() * np.sqrt(252) * 100).rank(pct=True).iloc[-1] * 100
         ivp90 = (returns.rolling(90).std() * np.sqrt(252) * 100).rank(pct=True).iloc[-1] * 100
         ivp1y = (returns.rolling(252).std() * np.sqrt(252) * 100).rank(pct=True).iloc[-1] * 100
@@ -144,7 +131,6 @@ class VolatilityEngine:
         if daily.empty:
             return pd.DataFrame()
 
-        # Create a copy to avoid mutating source
         df = daily.copy()
         
         # If we have intraday data, aggregate it into a 'Today' candle
@@ -161,7 +147,6 @@ class VolatilityEngine:
         else:
             # Minimal fallback if no intraday data (just use spot)
             last_date = df.iloc[-1]["timestamp"]
-            # If last date is not today, append a dummy candle
             if last_date.date() < pd.Timestamp.now().date():
                 today_candle = {
                     "timestamp": pd.Timestamp.now().normalize(),
@@ -173,10 +158,9 @@ class VolatilityEngine:
                     "oi": 0
                 }
             else:
-                return df # Data is already up to date? (Unlikely for live trading)
+                return df 
 
-        # Append
-        # Check if the last row in Daily is actually Today (some APIs update EOD data real-time)
+        # Append or Update
         if df.iloc[-1]["timestamp"].date() == pd.Timestamp.now().date():
             # Update the last row
             idx = df.index[-1]
@@ -192,32 +176,52 @@ class VolatilityEngine:
 
     def _run_garch_models(self, returns: pd.Series) -> Tuple[float, float]:
         """
-        Runs GARCH(1,1) safely. 
-        Returns (Forecast_7_Day, Forecast_28_Day) annualized vol.
+        Runs GARCH(1,1) safely with proper scaling.
+        Returns (Forecast_7_Day, Forecast_28_Day) annualized vol in percentage.
         """
         try:
-            # Scale returns for numerical stability (GARCH prefers pct * 100)
-            scaled_returns = returns * 100
+            # Ensure returns are clean
+            clean_returns = returns.dropna()
+            if len(clean_returns) < 50:
+                logger.warning("Insufficient data for GARCH (need 50+ points)")
+                return np.nan, np.nan
             
-            # Basic GARCH(1,1)
-            model = arch_model(scaled_returns, vol="Garch", p=1, q=1, dist="normal")
+            # Fit GARCH(1,1) model with rescaling enabled
+            model = arch_model(
+                clean_returns, 
+                vol="Garch",
+                p=1,
+                q=1,
+                dist="normal",
+                rescale=True  # Lets ARCH scale up the returns (e.g. by 10x or 100x)
+            )
+            
             res = model.fit(disp="off", show_warning=False)
             
-            # Forecast
+            # Capture the scale factor ARCH used
+            scale = res.scale
+            
+            # Forecast variance
             forecast = res.forecast(horizon=28, reindex=False)
-            variance = forecast.variance.iloc[-1] # Series of variances
+            variance = forecast.variance.iloc[-1]  # Series of variances (SCALED)
             
-            # Convert to Annualized Vol
-            # Variance is for daily returns. 
-            # Vol = sqrt(variance) * sqrt(252) / 100 (rescale back)
+            # Calculate Daily Volatility (still scaled)
+            daily_vol_7 = np.sqrt(variance.iloc[:7].mean())
+            daily_vol_28 = np.sqrt(variance.iloc[:28].mean())
             
-            # 7-day forecast (approx by taking first 7 days avg var)
-            var7 = variance.iloc[:7].mean()
-            garch7 = np.sqrt(var7) * np.sqrt(252) # Already scaled *100 implicitly by input
+            # ✅ DE-SCALE to get back to original units
+            if scale > 1.0:
+                daily_vol_7 /= scale
+                daily_vol_28 /= scale
+                
+            # Annualize: Daily Vol * sqrt(252) * 100
+            garch7 = daily_vol_7 * np.sqrt(252) * 100
+            garch28 = daily_vol_28 * np.sqrt(252) * 100
             
-            # 28-day forecast
-            var28 = variance.iloc[:28].mean()
-            garch28 = np.sqrt(var28) * np.sqrt(252)
+            # Sanity check results
+            if not (1 < garch7 < 200) or not (1 < garch28 < 200):
+                logger.warning(f"GARCH produced unrealistic values: {garch7:.2f}, {garch28:.2f}")
+                return np.nan, np.nan
             
             return float(garch7), float(garch28)
             
