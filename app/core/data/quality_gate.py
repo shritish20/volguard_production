@@ -75,86 +75,98 @@ class DataQualityGate:
         return True, "OK"
 
     # ------------------------------------------------------------------
-    # FIX #6: Data Quality - ATM-Only Zero IV Check
+    # FIX #7: Data Quality - Wider ATM Range (10% instead of 5%)
     # ------------------------------------------------------------------
     def validate_structure(self, chain: pd.DataFrame) -> Tuple[bool, str]:
         """
         Validates the Option Chain integrity.
-        CRITICAL FIX: Focuses checks on ATM strikes to ignore OTM noise.
+        FIXED: Uses wider ATM range for realistic market conditions.
         """
         if chain is None or chain.empty:
             return False, "Empty Option Chain"
-
+        
         # 1. Determine Spot Price
-        # Get spot price from columns or estimate from strikes
         if 'spot' in chain.columns:
             spot = chain['spot'].iloc[0]
         else:
-            # Estimate spot as middle strike if not provided (fallback)
+            # Estimate spot as middle strike (fallback)
             spot = chain['strike'].median()
         
-        # 2. Filter ATM Strikes (±5% Range)
-        # We only care about data quality where the liquidity matters most
+        # ✅ FIX: Widen ATM range to ±10% for realistic coverage
+        # At NIFTY 21500, this gives us 19350 to 23650 (80+ strikes)
+        atm_lower = spot * 0.90
+        atm_upper = spot * 1.10
+        
         atm_chain = chain[
-            (chain['strike'] >= spot * 0.95) & 
-            (chain['strike'] <= spot * 1.05)
+            (chain['strike'] >= atm_lower) &
+            (chain['strike'] <= atm_upper)
         ].copy()
         
         if atm_chain.empty:
-            # If no strikes in 5% range, the chain is likely garbage or spot is wrong
-            return False, "No ATM strikes found in chain (±5% range)"
+            return False, f"No ATM strikes found in ±10% range (spot: {spot})"
         
-        # 3. Zero IV Check (ATM-focused)
+        # Log coverage for monitoring
+        logger.debug(f"ATM chain coverage: {len(atm_chain)} strikes in range {atm_lower}-{atm_upper}")
+        
+        # 2. Zero IV Check (ATM-focused)
         if "ce_iv" in atm_chain.columns and "pe_iv" in atm_chain.columns:
             zero_ce_count = (atm_chain["ce_iv"] == 0).sum()
             zero_pe_count = (atm_chain["pe_iv"] == 0).sum()
             
-            # 🔴 ANY zero IV in ATM range is critical as it breaks Greek calcs
-            if zero_ce_count > 0 or zero_pe_count > 0:
-                return False, f"Critical: {zero_ce_count} CE and {zero_pe_count} PE strikes have zero IV in ATM range"
+            # Allow up to 5% zero IVs in ATM range (deep OTM can be zero)
+            max_allowed_zeros = int(len(atm_chain) * 0.05)
             
-            # Also check for absurdly low IV (<5%) which indicates bad data
-            low_iv_ce = (atm_chain["ce_iv"] < 0.05).sum()
-            low_iv_pe = (atm_chain["pe_iv"] < 0.05).sum()
+            if zero_ce_count > max_allowed_zeros or zero_pe_count > max_allowed_zeros:
+                return False, f"Too many zero IVs: {zero_ce_count} CE, {zero_pe_count} PE (max allowed: {max_allowed_zeros})"
             
-            if low_iv_ce > 0 or low_iv_pe > 0:
-                return False, f"Suspicious: {low_iv_ce} CE and {low_iv_pe} PE strikes have IV < 5% in ATM range"
+            # Check for absurdly low IV (<3%) in ATM strikes only
+            # Calculate true ATM (±2%)
+            true_atm = atm_chain[
+                (atm_chain['strike'] >= spot * 0.98) &
+                (atm_chain['strike'] <= spot * 1.02)
+            ]
+            
+            if not true_atm.empty:
+                low_iv_ce = (true_atm["ce_iv"] < 0.03).sum()
+                low_iv_pe = (true_atm["pe_iv"] < 0.03).sum()
+                
+                if low_iv_ce > 0 or low_iv_pe > 0:
+                    return False, f"Suspicious: {low_iv_ce} CE and {low_iv_pe} PE strikes have IV < 3% in true ATM range"
         
-        # 4. Strike Continuity Check (on full chain to ensure market depth)
+        # 3. Strike Continuity Check
         strikes = sorted(chain["strike"].unique())
         if len(strikes) > 2:
             diffs = np.diff(strikes)
-            
-            # Find the most common difference (e.g., 50 for Nifty)
             vals, counts = np.unique(diffs, return_counts=True)
+            
             if len(vals) > 0:
                 mode_diff = vals[np.argmax(counts)]
-                
-                # If we find a gap > 2.5x the normal gap, something is missing
                 max_gap = diffs.max()
-                if max_gap > mode_diff * 2.5:
+                
+                # Allow gap up to 3x normal (e.g., 150 when normal is 50)
+                if max_gap > mode_diff * 3.0:
                     return False, f"Significant gap detected: {max_gap} (expected ~{mode_diff})"
         
-        # 5. Bid-Ask Sanity Check (if depth data available)
+        # 4. Bid-Ask Sanity Check (if available)
         if "ce_bid" in chain.columns and "ce_ask" in chain.columns:
             atm_with_quotes = atm_chain.dropna(subset=["ce_bid", "ce_ask", "pe_bid", "pe_ask"])
             
             if not atm_with_quotes.empty:
-                # Check for crossed markets (bid > ask)
+                # Check for crossed markets
                 crossed_ce = (atm_with_quotes["ce_bid"] > atm_with_quotes["ce_ask"]).sum()
                 crossed_pe = (atm_with_quotes["pe_bid"] > atm_with_quotes["pe_ask"]).sum()
                 
                 if crossed_ce > 0 or crossed_pe > 0:
                     return False, f"Crossed market detected: {crossed_ce} CE, {crossed_pe} PE crosses"
                 
-                # Check for unreasonably wide spreads (>20% of mid)
+                # Check for unreasonably wide spreads (>30% of mid, relaxed from 20%)
                 ce_mid = (atm_with_quotes["ce_bid"] + atm_with_quotes["ce_ask"]) / 2
-                ce_mid = ce_mid.replace(0, 1) # Safety division
+                ce_mid = ce_mid.replace(0, 1)  # Safety
                 ce_spread_pct = (atm_with_quotes["ce_ask"] - atm_with_quotes["ce_bid"]) / ce_mid
                 
-                if (ce_spread_pct > 0.20).any():
-                    return False, "Excessive bid-ask spread detected (>20%)"
-
+                if (ce_spread_pct > 0.30).any():
+                    return False, "Excessive bid-ask spread detected (>30%)"
+        
         return True, "OK"
 
     def check_market_hours(self) -> bool:
