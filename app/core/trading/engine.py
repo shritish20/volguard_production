@@ -1,125 +1,267 @@
 # app/core/trading/engine.py
 
 import logging
-from typing import Dict, Optional, Any
-from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from datetime import datetime, date
+
+from app.config import settings
+from app.services.instrument_registry import registry
 from app.core.trading.leg_builder import LegBuilder
 from app.core.trading.strategy_selector import StrategySelector
-from app.services.instrument_registry import registry
-from app.config import settings
+
+# EV & Capital Integration
+from app.core.ev import TrueEVEngine, RawEdgeInputs, CapitalBucketEngine
+from app.schemas.analytics import RegimeResult, VolMetrics
 
 logger = logging.getLogger(__name__)
 
+
 class TradingEngine:
+    """
+    VolGuard Execution Engine (v3.1 + EV Core)
+    ------------------------------------------
+    Decision Flow:
+    Regime Permission
+        → Strategy Candidate
+            → EV Go / No-Go
+                → Capital Bucket Permission
+                    → Lot Sizing
+                        → Leg Construction
+    """
+
     def __init__(self, market_client, config: Dict):
         self.client = market_client
         self.config = config
+
+        # Core Components
         self.selector = StrategySelector()
         self.builder = LegBuilder()
 
-    async def analyze_and_select(self, regime_data, snapshot, cap_governor) -> Optional[Dict]:
-        """
-        Main decision pipeline: Regime -> Strategy -> Strike Selection -> Sizing
-        """
-        # 1. Select Strategy Class
-        strategy_def = self.selector.select_strategy(regime_data, snapshot)
-        if not strategy_def:
-            return None
-
-        # 2. Select Expiry (Nearest Weekly, 2-45 DTE)
-        chain = await self._get_best_expiry_chain(snapshot['symbol'])
-        if not chain:
-            logger.warning(f"No valid option chain found for {snapshot['symbol']}")
-            return None
-
-        # 3. Dynamic Sizing (The Fix)
-        lots = await self._suggest_lots(regime_data, cap_governor)
-        
-        # 4. Build Orders
-        legs = self.builder.build_legs(
-            strategy_def, 
-            chain, 
-            snapshot['spot'], 
-            lots=lots
+        # EV & Capital Engines
+        self.ev_engine = TrueEVEngine()
+        self.bucket_engine = CapitalBucketEngine(
+            total_capital=settings.BASE_CAPITAL
         )
-        
-        if not legs:
-            return None
 
-        return {
-            "strategy": strategy_def.name,
-            "orders": legs,
-            "lots": lots,
-            "expiry": chain['expiry'],
-            "regime_context": regime_data.name
-        }
-
-    async def _suggest_lots(self, regime, cap_governor) -> int:
+    async def generate_entry_orders(
+        self,
+        regime: RegimeResult,
+        vol: VolMetrics,
+        snapshot: Dict
+    ) -> List[Dict]:
         """
-        Calculate safe position size based on Available Margin & Regime.
+        Main decision pipeline called by Supervisor.
+        Returns a list of order dictionaries (or empty list).
+        """
+
+        # -------------------------------------------------------------
+        # STEP 1: REGIME PERMISSION
+        # -------------------------------------------------------------
+        self.bucket_engine.enforce_regime(regime.name)
+
+        # Log active buckets for debugging
+        active_buckets = {k: b.active for k, b in self.bucket_engine.buckets.items()}
+        logger.debug(f"Bucket status: {active_buckets}")
+
+        if regime.name == "CASH" or regime.alloc_pct <= 0:
+            return []
+
+        # -------------------------------------------------------------
+        # STEP 2: STRATEGY SELECTION (THEORETICAL CANDIDATE)
+        # -------------------------------------------------------------
+        strategy_def = self.selector.select_strategy(regime, vol)
+
+        if not strategy_def:
+            logger.info(f"No strategy candidate for regime {regime.name}")
+            return []
+
+        # -------------------------------------------------------------
+        # STEP 3: EV VALIDATION (GO / NO-GO)
+        # -------------------------------------------------------------
+        current_iv = snapshot.get("vix", 0.0)
+
+        ev_inputs = RawEdgeInputs(
+            atm_iv=current_iv,
+            rv=vol.rv7,
+            garch=vol.garch7,
+            parkinson=vol.pk7,
+            ivp=vol.ivp1y,
+            fast_vol=snapshot.get("fast_vol", False)
+        )
+
+        ev_results = self.ev_engine.evaluate(
+            raw=ev_inputs,
+            regime=regime.name,
+            expected_theta={
+                strategy_def.name: 1000.0  # Conservative placeholder (V1 safe)
+            }
+        )
+
+        # EV veto check
+        if not ev_results:
+            logger.info(
+                f"⛔ EV blocked trade (negative expectancy) "
+                f"for strategy {strategy_def.name}"
+            )
+            return []
+
+        # Ensure selected strategy is actually in the EV-approved list
+        if not any(ev.strategy == strategy_def.name for ev in ev_results):
+            logger.info(f"⛔ Strategy {strategy_def.name} rejected by EV ranking")
+            return []
+
+        best_ev = ev_results[0]
+        logger.info(
+            f"✅ EV Passed | Strategy={best_ev.strategy} | "
+            f"EV={best_ev.final_ev:.4f} | RawEdge={best_ev.raw_edge:.2f}"
+        )
+
+        # -------------------------------------------------------------
+        # STEP 4: EXPIRY SELECTION
+        # -------------------------------------------------------------
+        # CRITICAL FIX: Use MarketClient to get LIVE chain data, not Registry
+        chain = await self._get_best_expiry_chain(snapshot.get("symbol", "NIFTY"))
+
+        if chain is None or chain.empty:
+            logger.warning("No valid option chain found")
+            return []
+
+        # -------------------------------------------------------------
+        # STEP 5: CAPITAL SIZING
+        # -------------------------------------------------------------
+        bucket_name = self._get_strategy_bucket(strategy_def.name)
+        lots = self._calculate_bucket_lots(bucket_name, regime)
+
+        if lots <= 0:
+            logger.info(f"Insufficient capital in bucket '{bucket_name}'")
+            return []
+
+        # -------------------------------------------------------------
+        # STEP 6: LEG CONSTRUCTION
+        # -------------------------------------------------------------
+        # Pass the LIVE chain to the builder so it can find liquid strikes
+        legs = await self.builder.build_legs(
+            strategy=strategy_def,
+            chain=chain,
+            lots=lots,
+            market_client=self.client
+        )
+
+        if not legs:
+            return []
+
+        logger.info(
+            f"🚀 Generated {len(legs)} legs | "
+            f"Strategy={strategy_def.name} | Lots={lots}"
+        )
+
+        return legs
+
+    # =============================================================
+    # INTERNAL HELPERS
+    # =============================================================
+
+    def _get_strategy_bucket(self, strategy_name: str) -> str:
+        """Maps strategies to capital buckets"""
+        name = strategy_name.upper()
+
+        if "INTRADAY" in name or "SCALP" in name:
+            return "INTRADAY"
+        if "IRON_CONDOR" in name or "FLY" in name:
+            return "WEEKLY"
+        if "POSITIONAL" in name or "CALENDAR" in name:
+            return "MONTHLY"
+        
+        return "WEEKLY"
+
+    def _calculate_bucket_lots(
+        self,
+        bucket_name: str,
+        regime: RegimeResult
+    ) -> int:
+        """
+        Conservative lot sizing using bucket + regime constraints.
         """
         try:
-            # 1. Get Real Available Funds (Live from Broker)
-            available_funds = await cap_governor.get_available_funds()
-            
-            # 2. Determine Budget based on Regime Ceiling
-            # Use the lesser of Target Budget (Regime %) or Real Cash
-            target_allocation = settings.BASE_CAPITAL * regime.alloc_pct
-            usable_cash = min(available_funds, target_allocation)
-            
-            # 3. Estimate Margin per Lot (Conservative Estimate)
-            est_margin_per_lot = settings.MARGIN_SELL_PER_LOT  # e.g., 120,000
-            
-            # 4. Raw Lot Calculation
-            if est_margin_per_lot <= 0: return 1
-            raw_lots = int(usable_cash / est_margin_per_lot)
-            
-            # 5. Apply Hard Limits (Config + Regime)
-            final_lots = max(1, min(
-                raw_lots, 
-                regime.max_lots, 
-                settings.MAX_TOTAL_LOTS
-            ))
-            
+            bucket_capital = self.bucket_engine.get_bucket_capital(bucket_name)
+
+            if bucket_capital <= 0:
+                return 0
+
+            # Global Limit (from Regime Alloc %)
+            global_cap_limit = settings.BASE_CAPITAL * regime.alloc_pct
+
+            # Use the tighter of the two constraints
+            usable_capital = min(bucket_capital, global_cap_limit)
+
+            # Conservative static margin (SELLING SAFETY)
+            # TODO: Link to CapitalGovernor.predict_margin() in V3.2
+            margin_per_lot = 150_000.0
+
+            if margin_per_lot <= 0:
+                return 0
+
+            raw_lots = int(usable_capital / margin_per_lot)
+
+            # Apply hard limits
+            final_lots = max(
+                0,
+                min(
+                    raw_lots,
+                    regime.max_lots,
+                    settings.REGIME_MAX_LOTS.get(regime.name, 0)
+                )
+            )
+
             return final_lots
 
         except Exception as e:
-            logger.error(f"Sizing Error: {e}")
-            return 1 # Fallback to minimum
+            logger.error(f"Lot sizing error: {e}")
+            return 0
 
-    async def _get_best_expiry_chain(self, symbol: str) -> Optional[Dict]:
+    async def _get_best_expiry_chain(self, symbol: str) -> Optional[object]:
         """
-        Finds the ideal weekly expiry:
-        - > 2 Days (Avoid Gamma Risk)
-        - < 45 Days (Avoid Liquidity Risk)
-        - Nearest valid one
+        Selects nearest valid expiry (2 <= DTE <= 45) and fetches 
+        the LIVE option chain with Greeks.
         """
         try:
-            # Fetch all expiries from Master Registry
-            all_chains = registry.get_option_chain(symbol)
-            if not all_chains:
+            # 1. Get Expiry Dates from Market Client (Dynamic)
+            # Returns tuple (weekly_expiry_str, monthly_expiry_str)
+            weekly, monthly = await self.client.get_expiries()
+            
+            if not weekly:
                 return None
+
+            today = date.today()
+            candidates = []
+
+            # Check Weekly
+            if weekly:
+                w_date = datetime.strptime(weekly, "%Y-%m-%d").date()
+                w_dte = (w_date - today).days
+                if 2 <= w_dte <= 45:
+                    candidates.append((w_dte, weekly))
             
-            valid_expiries = []
-            now = datetime.now().date()
-            
-            # Filter Expiries
-            for exp_date_str, chain_data in all_chains.items():
-                exp_date = datetime.strptime(exp_date_str, "%Y-%m-%d").date()
-                dte = (exp_date - now).days
-                
-                # Filter Logic
-                if 2 <= dte <= 45:
-                    valid_expiries.append((dte, chain_data))
-            
-            if not valid_expiries:
+            # Check Monthly
+            if monthly:
+                m_date = datetime.strptime(monthly, "%Y-%m-%d").date()
+                m_dte = (m_date - today).days
+                if 2 <= m_dte <= 45:
+                    candidates.append((m_dte, monthly))
+
+            if not candidates:
                 return None
-            
+
             # Sort by DTE (Nearest first)
-            valid_expiries.sort(key=lambda x: x[0])
+            candidates.sort(key=lambda x: x[0])
+            best_expiry_str = candidates[0][1]
+
+            # 2. Fetch the FULL CHAIN for this specific expiry
+            # This returns the DataFrame with 'ce_iv', 'ce_delta', etc.
+            chain_df = await self.client.get_option_chain(best_expiry_str)
             
-            return valid_expiries[0][1] # Return the chain data for nearest valid expiry
+            return chain_df
 
         except Exception as e:
-            logger.error(f"Expiry Selection Failed: {e}")
+            logger.error(f"Expiry selection/fetch failed: {e}")
             return None
