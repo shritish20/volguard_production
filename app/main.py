@@ -1,61 +1,51 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+# app/main.py
+
 import logging
-import uvicorn
-from prometheus_client import make_asgi_app
+from fastapi import FastAPI
 
 from app.config import settings
-from app.database import engine, init_db
-from app.api.v1.router import router as api_router
+from app.api.v1.router import api_router
 
-logging.basicConfig(level=logging.INFO)
+# 🔑 AUTHORITATIVE REGISTRY
+from app.services.instrument_registry import registry
+
 logger = logging.getLogger(__name__)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan manager for startup/shutdown"""
-    logger.info("Starting VolGuard API...")
-
-    # Initialize DB (Creates tables if missing)
-    await init_db()
-
-    yield
-
-    logger.info("Shutting down VolGuard API...")
-    await engine.dispose()
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title=settings.PROJECT_NAME,
-        version=settings.VERSION,
-        openapi_url=f"{settings.API_V1_STR}/openapi.json",
-        lifespan=lifespan
+        title=settings.API_TITLE,
+        version=settings.API_VERSION,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/api/v1/openapi.json",
     )
 
-    # Middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[""],  # Tighten this for real production
-        allow_credentials=True,
-        allow_methods=[""],
-        allow_headers=[""],
-    )
+    # --------------------------------------------------
+    # ROUTERS
+    # --------------------------------------------------
+    app.include_router(api_router, prefix="/api/v1")
 
-    # Routers
-    app.include_router(api_router, prefix=settings.API_V1_STR)
+    # --------------------------------------------------
+    # STARTUP: LOAD INSTRUMENT MASTER
+    # --------------------------------------------------
+    @app.on_event("startup")
+    async def startup_event():
+        """
+        Runs ONCE when FastAPI starts.
+        Loads Upstox Instrument Master into memory.
+        """
+        logger.info("🚀 VolGuard starting up...")
+        registry.load_master(force_refresh=False)
+        logger.info("✅ Instrument master loaded and ready")
 
-    # Prometheus metrics endpoint
-    metrics_app = make_asgi_app()
-    app.mount("/metrics", metrics_app)
-
-    @app.get("/health")
-    async def health_check():
-        return {"status": "healthy", "env": "production"}
+    # --------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        logger.info("🛑 VolGuard shutting down")
 
     return app
 
-app = create_app()
 
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+app = create_app()
