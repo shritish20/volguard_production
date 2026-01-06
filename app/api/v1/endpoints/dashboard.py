@@ -12,6 +12,9 @@ from app.services.persistence import PersistenceService
 from app.services.cache import cache
 from app.config import settings
 
+# 🔑 AUTHORITATIVE REGISTRY
+from app.services.instrument_registry import registry
+
 # Core Analytics Engines
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.structure import StructureEngine
@@ -27,30 +30,26 @@ from app.schemas.analytics import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# --- Validation Helper ---
+# ============================================================
+# VALIDATION HELPERS
+# ============================================================
+
 def is_valid_float(val):
-    """Check if a float value is valid (not infinity or NaN)"""
     if not isinstance(val, (int, float)):
         return True
     return not (math.isinf(val) or math.isnan(val))
 
+
 def sanitize_float(val, default=0.0, field_name="unknown"):
-    """
-    Sanitize float values, log errors, and return safe defaults.
-    This prevents JSON serialization crashes while alerting about calculation issues.
-    """
     if not isinstance(val, (int, float)):
         return val
-    
     if math.isinf(val) or math.isnan(val):
         logger.error(f"Invalid calculation detected for {field_name}: {val}")
         return default
-    
     return val
 
-# --- Helper for Frontend Tags ---
+
 def get_tag_meta(val, type_):
-    """Generate UI tags and colors based on metric thresholds"""
     if type_ == "IVP":
         if val < 20: return "CHEAP", "green"
         if val > 80: return "RICH", "red"
@@ -69,103 +68,62 @@ def get_tag_meta(val, type_):
         return "NEUTRAL", "default"
     return "-", "default"
 
+
 def mk_item(val, type_tag=None, suffix="", field_name="metric"):
-    """
-    Creates a standardized metric item for the dashboard.
-    Includes robust protection against invalid float values.
-    """
-    # Sanitize numeric values
     if isinstance(val, (int, float)):
-        val = sanitize_float(val, default=0.0, field_name=field_name)
-        v_str = f"{val:.2f}{suffix}"
+        val = sanitize_float(val, 0.0, field_name)
+        formatted = f"{val:.2f}{suffix}"
     else:
-        v_str = str(val)
-    
-    # Generate tags for valid numeric values
-    tag, color = get_tag_meta(val, type_tag) if type_tag and isinstance(val, (int, float)) else ("-", "default")
-    
-    return MetricItem(value=val, formatted=v_str, tag=tag, color=color)
+        formatted = str(val)
+
+    tag, color = (
+        get_tag_meta(val, type_tag)
+        if type_tag and isinstance(val, (int, float))
+        else ("-", "default")
+    )
+
+    return MetricItem(value=val, formatted=formatted, tag=tag, color=color)
+
 
 def validate_response_data(vol, st, ed, reg):
-    """
-    Validate critical metrics before caching.
-    Returns (is_valid, error_fields) tuple.
-    """
     error_fields = []
-    
-    # Check volatility metrics
-    critical_vol = [
+
+    critical = [
         (vol.spot, "spot"),
         (vol.vix, "vix"),
-        (vol.ivp30, "ivp30"),
-        (vol.rv7, "rv7")
-    ]
-    
-    # Check edge metrics
-    critical_edge = [
-        (ed.iv_weekly, "iv_weekly"),
-        (ed.vrp_rv_w, "vrp_rv_w"),
-        (ed.term_structure, "term_structure")
-    ]
-    
-    # Check structure metrics
-    critical_struct = [
+        (ed.term_structure, "term_structure"),
         (st.net_gex, "net_gex"),
-        (st.pcr, "pcr"),
-        (st.max_pain, "max_pain")
-    ]
-    
-    # Check regime scores
-    critical_regime = [
-        (reg.v_scr, "vol_score"),
-        (reg.s_scr, "struct_score"),
-        (reg.e_scr, "edge_score"),
         (reg.score, "total_score"),
-        (reg.alloc_pct, "alloc_pct")
+        (reg.alloc_pct, "alloc_pct"),
     ]
-    
-    all_critical = critical_vol + critical_edge + critical_struct + critical_regime
-    
-    for val, name in all_critical:
+
+    for val, name in critical:
         if not is_valid_float(val):
             error_fields.append(name)
-    
+
     return len(error_fields) == 0, error_fields
+
+# ============================================================
+# MAIN ENDPOINT
+# ============================================================
 
 @router.post("/analyze", response_model=FullAnalysisResponse)
 async def analyze_market_state(
     request: Request,
     market: MarketDataClient = Depends(get_market_client),
-    db: PersistenceService = Depends(get_persistence_service)
+    db: PersistenceService = Depends(get_persistence_service),
 ):
-    """
-    On-demand full market analysis using the VolGuard 3.0 Hybrid Engine.
-    Uses Postgres for History (Tier 1) and API for Live (Tier 3).
-    
-    ENHANCEMENTS:
-    - ✅ Redis caching (60s TTL) with validation
-    - ✅ Timeout protection (30s max)
-    - ✅ Safe error handling (no info leaks)
-    - ✅ Performance monitoring
-    - ✅ Comprehensive NaN/Infinity protection
-    - ✅ Cache poisoning prevention
-    """
-    
     start_time = asyncio.get_event_loop().time()
-    
-    # ========================================
-    # 🚀 ENHANCEMENT #1: REDIS CACHING
-    # ========================================
     cache_key = f"dashboard:analysis:{datetime.now().strftime('%Y%m%d%H%M')}"
-    
+
     try:
         cached = await cache.get(cache_key)
         if cached:
-            logger.info(f"Cache hit for {cache_key}")
+            logger.info("Cache hit")
             return FullAnalysisResponse.parse_raw(cached)
-    except Exception as e:
-        logger.warning(f"Cache read failed: {e}")
-    
+    except Exception:
+        pass
+
     # Initialize Engines
     vol_engine = VolatilityEngine()
     struct_engine = StructureEngine()
@@ -173,93 +131,58 @@ async def analyze_market_state(
     regime_engine = RegimeEngine()
 
     try:
-        # ========================================
-        # 🛡️ ENHANCEMENT #2: TIMEOUT PROTECTION
-        # ========================================
         async with asyncio.timeout(30):
-            
-            # 1. PARALLEL DATA FETCH (Smart Hybrid)
-            
-            # A. History (Tier 1 - Postgres)
+
+            # ====================================================
+            # 1. FETCH AUTHORITATIVE STRUCTURE (REGISTRY)
+            # ====================================================
+            weekly_expiry, monthly_expiry = registry.get_nifty_expiries()
+            specs = registry.get_nifty_contract_specs(weekly_expiry)
+            lot_size = specs["lot_size"]
+
+            # ====================================================
+            # 2. PARALLEL DATA FETCH
+            # ====================================================
             nh_task = db.load_daily_history(NIFTY_KEY, days=365)
             vh_task = db.load_daily_history(VIX_KEY, days=365)
-            
-            # B. Intraday & Live (Tier 2 & 3 - API)
             intra_task = market.get_intraday_candles(NIFTY_KEY)
             live_task = market.get_live_quote([NIFTY_KEY, VIX_KEY])
-            exp_task = market.get_expiries()
+            wc_task = market.get_option_chain(weekly_expiry)
+            mc_task = market.get_option_chain(monthly_expiry)
 
-            # Execute Gather
-            nh, vh, intra, live_data, (we, me) = await asyncio.gather(
-                nh_task, vh_task, intra_task, live_task, exp_task
+            nh, vh, intra, live, wc, mc = await asyncio.gather(
+                nh_task, vh_task, intra_task, live_task, wc_task, mc_task
             )
 
-            # Fallback: If DB is empty, fetch from API (Cold Start)
             if nh.empty:
-                logger.warning("DB history empty, fetching from API")
                 nh = await market.get_daily_candles(NIFTY_KEY)
             if vh.empty:
-                logger.warning("VIX history empty, fetching from API")
                 vh = await market.get_daily_candles(VIX_KEY)
 
-            if nh.empty or not we:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="Data Fetch Failed (History or Expiry missing)"
-                )
+            if nh.empty or wc.empty:
+                raise HTTPException(status_code=500, detail="Critical data missing")
 
-            # C. Fetch Option Chains (Tier 2)
-            chain_tasks = [market.get_option_chain(we)]
-            if me:
-                chain_tasks.append(market.get_option_chain(me))
-            
-            chains = await asyncio.gather(*chain_tasks)
-            wc = chains[0]
-            mc = chains[1] if len(chains) > 1 else None
+            spot = live.get(NIFTY_KEY, 0.0)
+            vix = live.get(VIX_KEY, 0.0)
 
-            # 2. LOGIC CALCULATION (The Brain)
-            spot_val = live_data.get(NIFTY_KEY, 0)
-            vix_val = live_data.get(VIX_KEY, 0)
-
-            # A. Volatility (Hybrid Calculation)
-            vol = await vol_engine.calculate_volatility(nh, intra, spot_val, vix_val)
-            
-            # B. Structure
-            contract_details = await market.get_contract_details("NIFTY")
-            lot_size = contract_details.get("lot_size", 50)
+            # ====================================================
+            # 3. ANALYTICS PIPELINE
+            # ====================================================
+            vol = await vol_engine.calculate_volatility(nh, intra, spot, vix)
             st = struct_engine.analyze_structure(wc, vol.spot, lot_size)
-            
-            # C. Edge
             ed = edge_engine.detect_edges(wc, mc, vol.spot, vol)
 
-            # D. External Metrics
-            fast_vol = False
-            if not intra.empty:
-                recent = intra.tail(15)
-                if not recent.empty:
-                    high = recent['high'].max()
-                    low = recent['low'].min()
-                    open_ = recent.iloc[0]['open']
-                    if open_ > 0 and ((high - low) / open_ * 100) > 1.5:
-                        fast_vol = True
-
-            ext = ExtMetrics(fii=0, dii=0, events=0, event_names=[], fast_vol=fast_vol)
-
-            # E. Regime (The Decision)
+            ext = ExtMetrics(fii=0, dii=0, events=0, event_names=[], fast_vol=False)
             reg = regime_engine.calculate_regime(vol, st, ed, ext)
 
-            # ========================================
-            # 🔍 ENHANCEMENT #6: DATA VALIDATION
-            # ========================================
-            is_valid, error_fields = validate_response_data(vol, st, ed, reg)
-            if not is_valid:
-                logger.error(f"Invalid calculations detected in fields: {error_fields}")
-                # Don't cache invalid data
+            is_valid, errors = validate_response_data(vol, st, ed, reg)
 
-            # 3. Response Construction with Sanitization
+            # ====================================================
+            # 4. RESPONSE
+            # ====================================================
             result = FullAnalysisResponse(
                 timestamp=datetime.now(),
-                
+
                 volatility=VolatilityDashboard(
                     spot=mk_item(vol.spot, field_name="spot"),
                     vix=mk_item(vol.vix, "IVP", field_name="vix"),
@@ -270,95 +193,63 @@ async def analyze_market_state(
                     rv_7_28=mk_item(vol.rv7, field_name="rv7"),
                     garch_7_28=mk_item(vol.garch7, field_name="garch7"),
                     parkinson_7_28=mk_item(vol.pk7, field_name="pk7"),
-                    is_fallback=vol.is_fallback
+                    is_fallback=vol.is_fallback,
                 ),
-                
+
                 edges=EdgeDashboard(
-                    iv_weekly=mk_item(ed.iv_weekly, suffix="%", field_name="iv_weekly"),
-                    iv_monthly=mk_item(ed.iv_monthly, suffix="%", field_name="iv_monthly"),
-                    vrp_rv_w=mk_item(ed.vrp_rv_w, "VRP", field_name="vrp_rv_w"),
-                    vrp_rv_m=mk_item(ed.vrp_rv_m, "VRP", field_name="vrp_rv_m"),
-                    vrp_ga_w=mk_item(ed.vrp_garch_w, "VRP", field_name="vrp_garch_w"),
-                    vrp_ga_m=mk_item(ed.vrp_garch_m, "VRP", field_name="vrp_garch_m"),
-                    vrp_pk_w=mk_item(ed.vrp_pk_w, "VRP", field_name="vrp_pk_w"),
-                    vrp_pk_m=mk_item(ed.vrp_pk_m, "VRP", field_name="vrp_pk_m"),
-                    term_structure=mk_item(ed.term_structure, "TERM", field_name="term_structure")
+                    iv_weekly=mk_item(ed.iv_weekly, "%", field_name="iv_weekly"),
+                    iv_monthly=mk_item(ed.iv_monthly, "%", field_name="iv_monthly"),
+                    vrp_rv_w=mk_item(ed.vrp_rv_w, "VRP"),
+                    vrp_rv_m=mk_item(ed.vrp_rv_m, "VRP"),
+                    vrp_ga_w=mk_item(ed.vrp_garch_w, "VRP"),
+                    vrp_ga_m=mk_item(ed.vrp_garch_m, "VRP"),
+                    vrp_pk_w=mk_item(ed.vrp_pk_w, "VRP"),
+                    vrp_pk_m=mk_item(ed.vrp_pk_m, "VRP"),
+                    term_structure=mk_item(ed.term_structure, "TERM"),
                 ),
-                
+
                 structure=StructureDashboard(
-                    net_gex=mk_item(st.net_gex, field_name="net_gex"),
-                    pcr=mk_item(st.pcr, field_name="pcr"),
-                    max_pain=mk_item(st.max_pain, field_name="max_pain"),
-                    skew_25d=mk_item(st.skew, "SKEW", "%", field_name="skew")
+                    net_gex=mk_item(st.net_gex),
+                    pcr=mk_item(st.pcr),
+                    max_pain=mk_item(st.max_pain),
+                    skew_25d=mk_item(st.skew, "SKEW", "%"),
                 ),
-                
+
                 scores=ScoresDashboard(
-                    vol_score=sanitize_float(reg.v_scr, 0, "vol_score"),
-                    struct_score=sanitize_float(reg.s_scr, 0, "struct_score"),
-                    edge_score=sanitize_float(reg.e_scr, 0, "edge_score"),
-                    risk_score=sanitize_float(reg.r_scr, 0, "risk_score"),
-                    total_score=sanitize_float(reg.score, 0, "total_score")
+                    vol_score=sanitize_float(reg.v_scr),
+                    struct_score=sanitize_float(reg.s_scr),
+                    edge_score=sanitize_float(reg.e_scr),
+                    risk_score=sanitize_float(reg.r_scr),
+                    total_score=sanitize_float(reg.score),
                 ),
-                
-                external={
-                    "fii_net": ext.fii, 
-                    "dii_net": ext.dii, 
-                    "events": ext.events, 
-                    "fast_vol": ext.fast_vol
-                },
-                
+
+                external={"fast_vol": False},
+
                 capital=CapitalDashboard(
                     regime_name=reg.name,
                     primary_edge=reg.primary_edge,
-                    allocation_pct=sanitize_float(reg.alloc_pct, 0.0, "alloc_pct"),
-                    max_lots=int(sanitize_float(reg.max_lots, 0, "max_lots")),
-                    recommendation=f"Allocate {sanitize_float(reg.alloc_pct, 0.0, 'alloc_pct')*100:.0f}% Capital ({int(sanitize_float(reg.max_lots, 0, 'max_lots'))} lots)"
-                )
+                    allocation_pct=sanitize_float(reg.alloc_pct),
+                    max_lots=int(sanitize_float(reg.max_lots)),
+                    recommendation=f"Allocate {reg.alloc_pct*100:.0f}% Capital ({int(reg.max_lots)} lots)",
+                ),
             )
-            
-            # ========================================
-            # 🚀 ENHANCEMENT #3: VALIDATED CACHING
-            # ========================================
+
             if is_valid:
-                try:
-                    await cache.set(cache_key, result.json(), ttl=60)
-                    logger.info(f"Cached validated result for {cache_key}")
-                except Exception as e:
-                    logger.warning(f"Cache write failed: {e}")
-            else:
-                logger.warning(f"Skipping cache due to invalid data: {error_fields}")
-            
-            # ========================================
-            # 📊 ENHANCEMENT #4: PERFORMANCE MONITORING
-            # ========================================
+                await cache.set(cache_key, result.json(), ttl=60)
+
             elapsed = asyncio.get_event_loop().time() - start_time
             logger.info(f"Analysis completed in {elapsed*1000:.0f}ms")
-            
+
             return result
-    
+
     except asyncio.TimeoutError:
-        logger.error("Analysis timeout after 30 seconds")
-        raise HTTPException(
-            status_code=504, 
-            detail="Market data processing timeout - please retry"
-        )
-    
-    except HTTPException:
-        raise
-    
+        raise HTTPException(status_code=504, detail="Analysis timeout")
+
     except Exception as e:
-        # ========================================
-        # 🛡️ ENHANCEMENT #5: SAFE ERROR HANDLING
-        # ========================================
-        logger.error(f"Analysis failed: {str(e)}", exc_info=True)
-        
-        if settings.ENVIRONMENT in ["production_live", "production_semi"]:
-            raise HTTPException(
-                status_code=500, 
-                detail="Market analysis temporarily unavailable. Please try again."
+        logger.error(f"Dashboard failure: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Market analysis temporarily unavailable"
+            if settings.ENVIRONMENT.startswith("production")
+            else str(e),
             )
-        else:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Analysis Error: {str(e)}"
-)
