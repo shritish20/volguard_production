@@ -22,7 +22,6 @@ services:
       timeout: 5s
       retries: 5
     restart: always
-    # ✅ OPTIMIZATION: Resource limits
     deploy:
       resources:
         limits:
@@ -49,7 +48,6 @@ services:
       timeout: 5s
       retries: 3
     restart: always
-    # ✅ OPTIMIZATION: Resource limits
     deploy:
       resources:
         limits:
@@ -78,7 +76,7 @@ services:
       # Timezone
       - TZ=Asia/Kolkata
       
-      # Upstox API - ✅ CRITICAL FIX: Added missing variables
+      # Upstox API
       - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
       - UPSTOX_REFRESH_TOKEN=${UPSTOX_REFRESH_TOKEN}
       - UPSTOX_CLIENT_ID=${UPSTOX_CLIENT_ID}
@@ -91,13 +89,13 @@ services:
       - PROJECT_NAME=${PROJECT_NAME}
       - VERSION=${VERSION}
       
-      # Risk Limits - ✅ CRITICAL FIX: Added MAX_PORTFOLIO_LOSS
+      # Risk Limits
       - BASE_CAPITAL=${BASE_CAPITAL}
       - MAX_DAILY_LOSS=${MAX_DAILY_LOSS}
       - MAX_PORTFOLIO_LOSS=${MAX_PORTFOLIO_LOSS}
       - MAX_POSITIONS=${MAX_POSITIONS}
       
-      # Supervisor Config - ✅ CRITICAL FIX: Added WebSocket flag
+      # Supervisor Config
       - SUPERVISOR_LOOP_INTERVAL=${SUPERVISOR_LOOP_INTERVAL}
       - SUPERVISOR_WEBSOCKET_ENABLED=${SUPERVISOR_WEBSOCKET_ENABLED}
       
@@ -114,7 +112,8 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./journal:/app/journal
-      - ./state:/app/state  # Kill Switch State
+      - ./state:/app/state
+      - ./alembic:/app/alembic
     command: python run_supervisor.py
     restart: unless-stopped
     healthcheck:
@@ -123,7 +122,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    # ✅ OPTIMIZATION: Resource limits
     deploy:
       resources:
         limits:
@@ -154,7 +152,7 @@ services:
       # Timezone
       - TZ=Asia/Kolkata
       
-      # Upstox API - ✅ CRITICAL FIX: Added missing variables
+      # Upstox API
       - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
       - UPSTOX_REFRESH_TOKEN=${UPSTOX_REFRESH_TOKEN}
       - UPSTOX_CLIENT_ID=${UPSTOX_CLIENT_ID}
@@ -175,17 +173,17 @@ services:
       - redis
     volumes:
       - ./logs:/app/logs
-      - ./state:/app/state  # Kill Switch State
+      - ./state:/app/state
+      - ./alembic:/app/alembic
+      - ./journal:/app/journal
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     restart: always
-    # ✅ OPTIMIZATION: Added health check
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-    # ✅ OPTIMIZATION: Resource limits
     deploy:
       resources:
         limits:
