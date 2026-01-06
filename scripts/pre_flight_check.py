@@ -47,18 +47,18 @@ class PreFlightCheck:
         self.start_time = time.time()
         self.critical_failures = 0
         self.warnings = 0
-        
+
     def print_header(self, text):
         """Print section header"""
         print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.END}")
         print(f"{Colors.BOLD}{Colors.CYAN}{text.center(60)}{Colors.END}")
         print(f"{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.END}")
-    
+
     def print_success(self, msg):
         """Print success message"""
         print(f"{Colors.GREEN}✅ {msg}{Colors.END}")
         self.results.append(("SUCCESS", msg))
-    
+
     def print_error(self, msg, critical=False):
         """Print error message"""
         if critical:
@@ -68,18 +68,18 @@ class PreFlightCheck:
         else:
             print(f"{Colors.RED}❌ {msg}{Colors.END}")
             self.results.append(("FAILURE", msg))
-    
+
     def print_warning(self, msg):
         """Print warning message"""
         print(f"{Colors.YELLOW}⚠️  {msg}{Colors.END}")
         self.warnings += 1
         self.results.append(("WARNING", msg))
-    
+
     def print_info(self, msg):
         """Print info message"""
         print(f"{Colors.BLUE}ℹ️  {msg}{Colors.END}")
         self.results.append(("INFO", msg))
-    
+
     async def check_system_resources(self):
         """Check system resources"""
         self.print_header("1. SYSTEM RESOURCES CHECK")
@@ -90,7 +90,7 @@ class PreFlightCheck:
             self.print_success(f"CPU: {cpu_count} cores")
         else:
             self.print_error(f"Insufficient CPU cores: {cpu_count} (need at least 4)", critical=True)
-        
+
         # RAM
         ram_gb = psutil.virtual_memory().total / (1024**3)
         if ram_gb >= 8:
@@ -99,7 +99,7 @@ class PreFlightCheck:
             self.print_warning(f"RAM: {ram_gb:.1f} GB (8+ GB recommended)")
         else:
             self.print_error(f"Insufficient RAM: {ram_gb:.1f} GB (need at least 4 GB)", critical=True)
-        
+
         # Disk space
         disk = shutil.disk_usage(".")
         free_gb = disk.free / (1024**3)
@@ -109,17 +109,17 @@ class PreFlightCheck:
             self.print_warning(f"Disk: {free_gb:.1f} GB free (50+ GB recommended for logs)")
         else:
             self.print_error(f"Low disk space: {free_gb:.1f} GB free", critical=True)
-        
+
         # Disk speed (simple write test)
         try:
             test_file = Path("disk_speed_test.tmp")
             start = time.time()
             with open(test_file, "wb") as f:
-                f.write(os.urandom(10 * 1024 * 1024))  # 10 MB
+                f.write(os.urandom(10 * 1024 * 1024)) # 10 MB
             write_time = time.time() - start
             os.remove(test_file)
-            
             speed_mbps = 10 / write_time
+            
             if speed_mbps >= 50:
                 self.print_success(f"Disk speed: {speed_mbps:.1f} MB/s")
             elif speed_mbps >= 10:
@@ -128,7 +128,7 @@ class PreFlightCheck:
                 self.print_error(f"Slow disk: {speed_mbps:.1f} MB/s", critical=False)
         except Exception as e:
             self.print_warning(f"Disk speed test failed: {e}")
-        
+
         # CPU performance (quick benchmark)
         try:
             start = time.time()
@@ -146,7 +146,7 @@ class PreFlightCheck:
                 self.print_error(f"Very slow CPU: {cpu_time:.2f}s for 1k×1k matmul", critical=False)
         except Exception as e:
             self.print_warning(f"CPU benchmark failed: {e}")
-    
+
     async def check_environment(self):
         """Validate environment configuration"""
         self.print_header("2. ENVIRONMENT CONFIGURATION")
@@ -158,7 +158,7 @@ class PreFlightCheck:
         else:
             self.print_error(".env file not found", critical=True)
             return False
-        
+
         # Required variables
         required_vars = [
             "UPSTOX_ACCESS_TOKEN",
@@ -178,7 +178,7 @@ class PreFlightCheck:
             return False
         
         self.print_success("All required environment variables present")
-        
+
         # Validate values
         try:
             base_capital = float(settings.BASE_CAPITAL)
@@ -190,7 +190,7 @@ class PreFlightCheck:
                 self.print_success(f"BASE_CAPITAL: ₹{base_capital:,.0f}")
         except:
             self.print_error("Invalid BASE_CAPITAL format", critical=True)
-        
+
         try:
             max_daily_loss = float(settings.MAX_DAILY_LOSS)
             if max_daily_loss <= 0:
@@ -201,7 +201,7 @@ class PreFlightCheck:
                 self.print_success(f"MAX_DAILY_LOSS: ₹{max_daily_loss:,.0f}")
         except:
             self.print_error("Invalid MAX_DAILY_LOSS format", critical=True)
-        
+
         # Environment mode
         env = settings.ENVIRONMENT
         if env == "production_live":
@@ -212,20 +212,20 @@ class PreFlightCheck:
             self.print_success(f"ENVIRONMENT: {env} - SHADOW MODE (SAFE)")
         else:
             self.print_warning(f"ENVIRONMENT: {env} - Unknown mode")
-        
+
         # Optional but recommended
         if not settings.TELEGRAM_BOT_TOKEN:
             self.print_warning("TELEGRAM_BOT_TOKEN not set - alerts disabled")
         else:
             self.print_success("Telegram alerts configured")
-        
+
         if not settings.ADMIN_SECRET:
             self.print_warning("ADMIN_SECRET not set - admin API disabled")
         else:
             self.print_success("Admin API configured")
-        
+            
         return True
-    
+
     async def check_network(self):
         """Check network connectivity and latency"""
         self.print_header("3. NETWORK CONNECTIVITY")
@@ -236,7 +236,7 @@ class PreFlightCheck:
             self.print_success("Internet connectivity: OK")
         except:
             self.print_error("No internet connectivity", critical=True)
-        
+
         # Check Upstox API endpoints
         endpoints = [
             ("Upstox API V2", "https://api.upstox.com/v2"),
@@ -260,10 +260,9 @@ class PreFlightCheck:
                     self.print_warning(f"{name}: {latency:.0f}ms latency (high)")
                 else:
                     self.print_error(f"{name}: {latency:.0f}ms latency (very high)", critical=False)
-                    
             except Exception as e:
                 self.print_error(f"{name}: Cannot connect - {e}", critical=True)
-        
+
         # Check local services
         try:
             sock = socket.create_connection(("localhost", 5432), timeout=2)
@@ -271,21 +270,21 @@ class PreFlightCheck:
             self.print_success("PostgreSQL port 5432: Listening")
         except:
             self.print_warning("PostgreSQL port 5432: Not listening (may start via Docker)")
-        
+
         try:
             sock = socket.create_connection(("localhost", 6379), timeout=2)
             sock.close()
             self.print_success("Redis port 6379: Listening")
         except:
             self.print_warning("Redis port 6379: Not listening (may start via Docker)")
-        
+
         try:
             sock = socket.create_connection(("localhost", 8000), timeout=2)
             sock.close()
             self.print_warning("Port 8000: Already in use (may conflict with API)")
         except:
             self.print_success("Port 8000: Available")
-    
+
     async def check_dependencies(self):
         """Check Python dependencies and versions"""
         self.print_header("4. DEPENDENCIES & VERSIONS")
@@ -299,7 +298,7 @@ class PreFlightCheck:
             self.print_success(f"Python {python_version} (>=3.11.0 required)")
         else:
             self.print_error(f"Python {python_version} (3.11.0+ required)", critical=True)
-        
+
         # Check critical packages
         critical_packages = [
             ("fastapi", "0.104.1"),
@@ -308,6 +307,7 @@ class PreFlightCheck:
             ("pandas", "2.0.0"),
             ("numpy", "1.24.0"),
             ("redis", "5.0.0"),
+            ("alembic", "1.13.0"), # Added Alembic check
         ]
         
         for package, min_version in critical_packages:
@@ -320,12 +320,11 @@ class PreFlightCheck:
                     self.print_success(f"{package}: {version}")
                 else:
                     self.print_error(f"{package}: {version} (<{min_version})", critical=True)
-                    
             except ImportError:
                 self.print_error(f"{package}: Not installed", critical=True)
             except Exception as e:
                 self.print_warning(f"{package}: Version check failed - {e}")
-        
+
         # Check if we can import all app modules
         try:
             from app.config import settings
@@ -335,7 +334,7 @@ class PreFlightCheck:
             self.print_success("All application modules import successfully")
         except Exception as e:
             self.print_error(f"Application import failed: {e}", critical=True)
-    
+
     async def check_database(self):
         """Validate database configuration and connection"""
         self.print_header("5. DATABASE CONFIGURATION")
@@ -349,39 +348,42 @@ class PreFlightCheck:
             async with AsyncSessionLocal() as session:
                 result = await session.execute(text("SELECT 1"))
                 val = result.scalar()
+                
                 if val == 1:
                     self.print_success("Database connection: OK")
                 else:
                     self.print_error("Database connection test failed", critical=True)
-            
-            # Check for required tables
-            async with AsyncSessionLocal() as session:
+                
+                # Check for required tables
                 result = await session.execute(text(
                     "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
                 ))
                 tables = [row[0] for row in result.fetchall()]
-            
-            required_tables = ["trade_records", "decision_journal", "historical_candles", "approval_requests"]
-            missing_tables = [t for t in required_tables if t not in tables]
-            
-            if missing_tables:
-                self.print_error(f"Missing database tables: {', '.join(missing_tables)}", critical=True)
-                self.print_info("Run: docker-compose run --rm api alembic upgrade head")
-            else:
-                self.print_success("All required database tables exist")
-            
-            # Check table sizes (for existing data)
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(text(
-                    "SELECT tablename, pg_size_pretty(pg_total_relation_size('\"' || tablename || '\"')) as size "
-                    "FROM pg_tables WHERE schemaname = 'public'"
-                ))
-                for row in result.fetchall():
-                    self.print_info(f"  {row[0]}: {row[1]}")
-            
+                
+                required_tables = ["trade_records", "decision_journal", "historical_candles", "approval_requests", "alembic_version"]
+                missing_tables = [t for t in required_tables if t not in tables]
+                
+                if missing_tables:
+                    # Not critical if Alembic hasn't run yet, but warn
+                    self.print_warning(f"Missing database tables: {', '.join(missing_tables)}")
+                    self.print_info("Tables will be created during deployment via Alembic")
+                else:
+                    self.print_success("All required database tables exist")
+                
+                # Check table sizes (for existing data)
+                try:
+                    result = await session.execute(text(
+                        "SELECT tablename, pg_size_pretty(pg_total_relation_size('\"' || tablename || '\"')) as size "
+                        "FROM pg_tables WHERE schemaname = 'public'"
+                    ))
+                    for row in result.fetchall():
+                        self.print_info(f"  {row[0]}: {row[1]}")
+                except:
+                    pass
+
         except Exception as e:
             self.print_error(f"Database check failed: {e}", critical=True)
-    
+
     async def check_redis(self):
         """Validate Redis configuration and connection"""
         self.print_header("6. REDIS CONFIGURATION")
@@ -395,7 +397,6 @@ class PreFlightCheck:
             # Test basic operations
             test_key = "preflight_test"
             test_value = str(time.time())
-            
             await r.set(test_key, test_value, ex=10)
             retrieved = await r.get(test_key)
             
@@ -403,7 +404,7 @@ class PreFlightCheck:
                 self.print_success("Redis read/write: OK")
             else:
                 self.print_error("Redis read/write test failed", critical=True)
-            
+                
             # Check memory usage
             info = await r.info("memory")
             used_memory = int(info.get("used_memory", 0))
@@ -417,14 +418,13 @@ class PreFlightCheck:
                     self.print_warning(f"Redis memory: {memory_percent:.1f}% used (high)")
             else:
                 self.print_info(f"Redis memory used: {used_memory / 1024 / 1024:.1f} MB")
-            
+                
             await r.close()
-            
         except redis.ConnectionError as e:
             self.print_error(f"Redis connection failed: {e}", critical=True)
         except Exception as e:
             self.print_error(f"Redis check failed: {e}", critical=True)
-    
+
     async def check_upstox_api(self):
         """Validate Upstox API access"""
         self.print_header("7. UPSTOX API ACCESS")
@@ -456,7 +456,7 @@ class PreFlightCheck:
                     self.print_success(f"Today ({today}) is a trading day")
             else:
                 self.print_warning("Could not fetch holiday calendar")
-            
+                
             # Test contract details
             contract = await client.get_contract_details("NIFTY")
             if contract:
@@ -467,19 +467,17 @@ class PreFlightCheck:
                     self.print_warning("Could not determine NIFTY lot size")
             else:
                 self.print_warning("Could not fetch contract details")
-            
+                
             await client.close()
-            
         except Exception as e:
             self.print_error(f"Upstox API access failed: {e}", critical=True)
             self.print_info("Check if token is expired: python scripts/token_manager.py")
-    
+
     async def check_filesystem(self):
         """Check filesystem permissions and structure"""
         self.print_header("8. FILESYSTEM & PERMISSIONS")
         
         required_dirs = ["logs", "journal", "data"]
-        
         for dir_name in required_dirs:
             path = Path(dir_name)
             path.mkdir(exist_ok=True)
@@ -499,7 +497,7 @@ class PreFlightCheck:
                 free_inodes = stat.f_favail
                 if free_inodes < 1000:
                     self.print_warning(f"{dir_name}/: Low inodes ({free_inodes})")
-        
+
         # Check log file permissions
         log_files = ["logs/volguard.log", "logs/volguard_errors.log"]
         for log_file in log_files:
@@ -511,7 +509,7 @@ class PreFlightCheck:
                     self.print_success(f"{log_file}: Appendable")
                 except Exception as e:
                     self.print_warning(f"{log_file}: Cannot append - {e}")
-        
+
         # Check journal directory
         journal_path = Path("journal")
         if journal_path.exists():
@@ -522,7 +520,7 @@ class PreFlightCheck:
                 self.print_info("Journal: No existing journal files")
         else:
             self.print_success("Journal directory created")
-    
+
     async def check_market_hours(self):
         """Check if market is open"""
         self.print_header("9. MARKET HOURS CHECK")
@@ -532,7 +530,6 @@ class PreFlightCheck:
         
         ist = pytz.timezone("Asia/Kolkata")
         now = datetime.now(ist)
-        
         market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
         
@@ -544,7 +541,6 @@ class PreFlightCheck:
                 self.print_warning("Market just opened (first 15 mins - high volatility)")
             elif (market_close - now).total_seconds() < 900:
                 self.print_warning("Market closing soon (last 15 mins - high volatility)")
-                
         else:
             self.print_warning(f"Market is CLOSED (Current IST: {now.strftime('%H:%M:%S')})")
             
@@ -558,7 +554,7 @@ class PreFlightCheck:
                 tomorrow_open = tomorrow.replace(hour=9, minute=15, second=0, microsecond=0)
                 hours_until = (tomorrow_open - now).total_seconds() / 3600
                 self.print_info(f"Market opens tomorrow in {hours_until:.1f} hours")
-    
+
     async def check_docker(self):
         """Check Docker availability"""
         self.print_header("10. DOCKER & CONTAINERS")
@@ -571,28 +567,27 @@ class PreFlightCheck:
             else:
                 self.print_error("Docker not installed or not in PATH", critical=True)
                 return
-            
+
             # Check Docker Compose
             result = subprocess.run(["docker-compose", "--version"], capture_output=True, text=True)
             if result.returncode == 0:
                 self.print_success(f"Docker Compose: {result.stdout.strip()}")
             else:
                 self.print_warning("Docker Compose not found (docker compose may be available)")
-            
+
             # Check if Docker daemon is running
             result = subprocess.run(["docker", "info"], capture_output=True, text=True)
             if result.returncode == 0:
                 self.print_success("Docker daemon: Running")
             else:
                 self.print_error("Docker daemon not running", critical=True)
-            
+
             # Check for existing VolGuard containers
             result = subprocess.run(
                 ["docker", "ps", "-a", "--filter", "name=volguard", "--format", "{{.Names}}"],
                 capture_output=True, text=True
             )
             existing_containers = [c for c in result.stdout.strip().split('\n') if c]
-            
             if existing_containers:
                 self.print_warning(f"Existing VolGuard containers: {', '.join(existing_containers)}")
                 self.print_info("Run: docker-compose down (to clean up)")
@@ -603,14 +598,64 @@ class PreFlightCheck:
             self.print_error(f"Docker check failed: {e}", critical=True)
         except Exception as e:
             self.print_warning(f"Docker check incomplete: {e}")
-    
+
+    async def check_alembic(self):
+        """Check Alembic migrations setup"""
+        self.print_header("11. ALEMBIC MIGRATIONS")
+        
+        # Check alembic directory exists
+        alembic_dir = Path("alembic")
+        if not alembic_dir.exists():
+            self.print_error("alembic/ directory not found", critical=True)
+            self.print_info("Run: alembic init alembic")
+            return
+        else:
+            self.print_success("alembic/ directory exists")
+        
+        # Check env.py exists
+        env_file = alembic_dir / "env.py"
+        if env_file.exists():
+            self.print_success("alembic/env.py exists")
+        else:
+            self.print_error("alembic/env.py missing", critical=True)
+            return
+        
+        # Check versions directory
+        versions_dir = alembic_dir / "versions"
+        if versions_dir.exists():
+            migrations = list(versions_dir.glob("*.py"))
+            if migrations:
+                self.print_success(f"Found {len(migrations)} migration(s)")
+                for migration in migrations[:5]:  # Show first 5
+                    self.print_info(f"  • {migration.name}")
+            else:
+                self.print_warning("No migrations found yet")
+                self.print_info("Will be created on first deployment")
+        else:
+            self.print_error("alembic/versions/ directory missing", critical=True)
+        
+        # Check alembic.ini
+        alembic_ini = Path("alembic.ini")
+        if alembic_ini.exists():
+            self.print_success("alembic.ini exists")
+            
+            # Verify it has script_location configured
+            with open(alembic_ini) as f:
+                content = f.read()
+                if "script_location = alembic" in content:
+                    self.print_success("alembic.ini properly configured")
+                else:
+                    self.print_warning("alembic.ini may need configuration")
+        else:
+            self.print_error("alembic.ini missing", critical=True)
+
     async def run_all_checks(self):
         """Run all pre-flight checks"""
         self.print_header("🚀 VOLGUARD PRE-FLIGHT CHECK")
         print(f"{Colors.BOLD}Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Colors.END}")
         print(f"{Colors.BOLD}Environment: {os.getenv('ENVIRONMENT', 'unknown')}{Colors.END}")
         print()
-        
+
         checks = [
             ("System Resources", self.check_system_resources),
             ("Environment", self.check_environment),
@@ -622,34 +667,34 @@ class PreFlightCheck:
             ("Filesystem", self.check_filesystem),
             ("Market Hours", self.check_market_hours),
             ("Docker", self.check_docker),
+            ("Alembic Migrations", self.check_alembic),
         ]
-        
+
         for name, check_func in checks:
             try:
                 await check_func()
             except Exception as e:
                 self.print_error(f"{name} check crashed: {e}", critical=True)
             print()
-        
+
         # Summary
         elapsed = time.time() - self.start_time
         self.print_header("📊 PRE-FLIGHT SUMMARY")
-        
         print(f"{Colors.BOLD}Checks completed in {elapsed:.1f} seconds{Colors.END}")
         print()
-        
+
         # Count results
         success_count = sum(1 for status, _ in self.results if status == "SUCCESS")
         failure_count = sum(1 for status, _ in self.results if status == "FAILURE")
         critical_count = sum(1 for status, _ in self.results if status == "CRITICAL_FAILURE")
         warning_count = sum(1 for status, _ in self.results if status == "WARNING")
-        
+
         print(f"{Colors.GREEN}✅ Successes: {success_count}{Colors.END}")
         print(f"{Colors.YELLOW}⚠️  Warnings: {warning_count}{Colors.END}")
         print(f"{Colors.RED}❌ Failures: {failure_count}{Colors.END}")
-        print(f"{Colors.RED}{Colors.BOLD}💀 Critical: {critical_count}{Colors.END}")
+        print(f"{Colors.RED}{Colors.BOLD}💀 Critical: {critical_count} {Colors.END}")
         print()
-        
+
         # Show critical failures first
         if critical_count > 0:
             print(f"{Colors.BOLD}{Colors.RED}CRITICAL FAILURES:{Colors.END}")
@@ -657,18 +702,18 @@ class PreFlightCheck:
                 if status == "CRITICAL_FAILURE":
                     print(f"  • {msg}")
             print()
-        
+
         # Show warnings
         if warning_count > 0:
-            print(f"{Colors.BOLD}{Colors.Yellow}WARNINGS:{Colors.END}")
+            print(f"{Colors.BOLD}{Colors.YELLOW}WARNINGS:{Colors.END}")
             for status, msg in self.results:
                 if status == "WARNING":
                     print(f"  • {msg}")
             print()
-        
+
         # Recommendations
         if critical_count == 0 and failure_count == 0:
-            print(f"{Colors.BOLD}{Colors.GREEN}🎉 ALL CHECKS PASSED!{Colors.END}")
+            print(f"{Colors.BOLD}{Colors.GREEN}🎉 ALL CHECKS PASSED! {Colors.END}")
             print("System is ready for deployment.")
             print()
             print(f"{Colors.BOLD}Next steps:{Colors.END}")
@@ -707,7 +752,7 @@ async def main():
         if response.lower() != 'y':
             print("Exiting.")
             return 1
-    
+            
     # Run checks
     checker = PreFlightCheck()
     return await checker.run_all_checks()
