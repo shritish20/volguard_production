@@ -8,138 +8,150 @@ import gzip
 import io
 import json
 from datetime import datetime, date
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+UPSTOX_MASTER_URL = (
+    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+)
+
 class InstrumentRegistry:
     """
-    VolGuard Smart Registry (VolGuard 3.0)
+    VolGuard Instrument Registry (AUTHORITATIVE)
     
-    Responsibilities:
-    1. MASTER DATA: Downloads & Caches Upstox Contract Master (Verified JSON).
-    2. RESOLUTION: Converts Symbols <-> Tokens.
-    3. METADATA: Provides Lot Size, Tick Size, Freeze Limits.
-    4. DYNAMIC CONTRACTS: Finds 'Current Month Future' automatically.
+    SINGLE SOURCE OF TRUTH FOR:
+    - Expiries (Weekly / Monthly)
+    - Lot Size
+    - Tick Size
+    - Freeze Quantity
+    - Instrument Existence
+
+    ZERO ASSUMPTIONS.
+    Exchange/Broker master only.
     """
 
     def __init__(self, cache_file: str = "instruments_cache.json"):
         self.cache_file = cache_file
-        self.master_df = pd.DataFrame()
-        self.symbol_map = {} 
-        self.token_map = {}  
-        self.last_update = None
+        self.master_df: pd.DataFrame = pd.DataFrame()
+        self.last_update: Optional[date] = None
 
-    def load_master(self, force_refresh: bool = False):
-        """
-        Loads master contract file. 
-        Tries local cache first, else downloads from Upstox.
-        """
-        # 1. Try Local Cache
+    # ------------------------------------------------------------------
+    # LOAD & CACHE MASTER
+    # ------------------------------------------------------------------
+    def load_master(self, force_refresh: bool = False) -> None:
         if not force_refresh and os.path.exists(self.cache_file):
-            file_time = datetime.fromtimestamp(os.path.getmtime(self.cache_file)).date()
-            if file_time == date.today():
-                logger.info("Loading instruments from local cache...")
-                try:
-                    self.master_df = pd.read_json(self.cache_file)
-                    # JSON serialization turns timestamps to ints, need to convert back if loading from cache
-                    if 'expiry' in self.master_df.columns:
-                         self.master_df['expiry'] = pd.to_datetime(self.master_df['expiry'], unit='ms', errors='ignore')
-                    self._build_maps()
-                    return
-                except Exception as e:
-                    logger.warning(f"Cache corrupt, forcing download: {e}")
-
-        # 2. Download Fresh
-        logger.info("Downloading fresh instrument master from Upstox (JSON)...")
-        try:
-            url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-            
-            with httpx.Client() as client:
-                resp = client.get(url, timeout=60.0)
-                resp.raise_for_status()
-                
-                with gzip.open(io.BytesIO(resp.content), 'rt', encoding='utf-8') as f:
-                    data = json.load(f)
-            
-            # 3. Process Data
-            temp_df = pd.DataFrame(data)
-            
-            # Normalization (Handle naming variations)
-            if 'trading_symbol' in temp_df.columns:
-                temp_df.rename(columns={'trading_symbol': 'tradingsymbol'}, inplace=True)
-            
-            # 4. Filter for Equity Derivatives (NSE_FO) & Nifty Indices
-            # Note: Upstox JSON 'segment' is usually "NSE_FO" for F&O
-            # We also filter for NIFTY/BANKNIFTY to keep RAM usage low (~10k rows vs 80k)
-            self.master_df = temp_df[
-                (temp_df['segment'] == 'NSE_FO') & 
-                (temp_df['tradingsymbol'].str.contains('NIFTY|BANKNIFTY|FINNIFTY', case=False, na=False))
-            ].copy()
-            
-            # 5. Fix Expiry (Critical: Convert ms timestamp to datetime)
-            if 'expiry' in self.master_df.columns:
-                # Upstox sends expiry as 1774463399000 (ms)
-                self.master_df['expiry'] = pd.to_datetime(self.master_df['expiry'], unit='ms')
-            
-            # Save to cache
-            self.master_df.to_json(self.cache_file, index=False)
-            self._build_maps()
-            logger.info(f"Instrument Master Loaded: {len(self.master_df)} contracts")
-            
-        except Exception as e:
-            logger.critical(f"Failed to download Instrument Master: {e}")
-            # Fallback
-            if os.path.exists(self.cache_file):
-                logger.warning("Using stale cache due to download failure.")
+            file_date = datetime.fromtimestamp(
+                os.path.getmtime(self.cache_file)
+            ).date()
+            if file_date == date.today():
+                logger.info("📦 Loading instrument master from cache")
                 self.master_df = pd.read_json(self.cache_file)
-                self._build_maps()
-            else:
-                raise RuntimeError("Instrument Registry Failed: No Data Available")
+                self._normalize()
+                return
 
-    def _build_maps(self):
-        """Indexing for O(1) lookups"""
+        logger.info("⬇️ Downloading fresh Upstox instrument master")
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.get(UPSTOX_MASTER_URL)
+            resp.raise_for_status()
+
+            with gzip.open(io.BytesIO(resp.content), "rt", encoding="utf-8") as f:
+                raw = json.load(f)
+
+        self.master_df = pd.DataFrame(raw)
+        self._normalize()
+        self.master_df.to_json(self.cache_file, index=False)
+        self.last_update = date.today()
+
+        logger.info(f"✅ Instrument master loaded: {len(self.master_df)} rows")
+
+    # ------------------------------------------------------------------
+    # NORMALIZATION
+    # ------------------------------------------------------------------
+    def _normalize(self) -> None:
+        df = self.master_df
+
+        if "trading_symbol" in df.columns:
+            df.rename(columns={"trading_symbol": "tradingsymbol"}, inplace=True)
+
+        if "expiry" in df.columns:
+            df["expiry"] = pd.to_datetime(df["expiry"], unit="ms", errors="coerce")
+
+        self.master_df = df
+
+    # ------------------------------------------------------------------
+    # NIFTY EXPIRY RESOLUTION (NO ASSUMPTIONS)
+    # ------------------------------------------------------------------
+    def get_nifty_expiries(self) -> Tuple[str, str]:
+        """
+        Returns:
+            (weekly_expiry, monthly_expiry)
+
+        Logic:
+        - Derived ONLY from instrument master
+        - Uses Upstox `weekly` flag
+        - No calendar assumptions
+        """
+
         if self.master_df.empty:
-            return
+            raise RuntimeError("Instrument master not loaded")
 
-        self.token_map = self.master_df.set_index('instrument_key').to_dict('index')
-        self.symbol_map = dict(zip(self.master_df['tradingsymbol'], self.master_df['instrument_key']))
+        today = pd.Timestamp.today().normalize()
 
-    def get_instrument_details(self, instrument_key: str) -> Dict:
-        return self.token_map.get(instrument_key, {})
+        opts = self.master_df[
+            (self.master_df["segment"] == "NSE_FO") &
+            (self.master_df["underlying_symbol"] == "NIFTY") &
+            (self.master_df["instrument_type"].isin(["CE", "PE"])) &
+            (self.master_df["expiry"] >= today)
+        ].copy()
 
-    def get_token_by_symbol(self, symbol: str) -> Optional[str]:
-        return self.symbol_map.get(symbol)
+        if opts.empty:
+            raise RuntimeError("No valid NIFTY option contracts found")
 
-    def get_current_future(self, underlying: str = "NIFTY") -> Optional[str]:
+        # Weekly expiry (authoritative)
+        weekly_expiry = (
+            opts[opts["weekly"] == True]["expiry"]
+            .min()
+            .date()
+        )
+
+        # Monthly expiry (authoritative)
+        monthly_expiry = (
+            opts[opts["weekly"] == False]["expiry"]
+            .min()
+            .date()
+        )
+
+        return weekly_expiry.strftime("%Y-%m-%d"), monthly_expiry.strftime("%Y-%m-%d")
+
+    # ------------------------------------------------------------------
+    # LOT SIZE / TICK SIZE / FREEZE LIMIT
+    # ------------------------------------------------------------------
+    def get_nifty_contract_specs(self, expiry: str) -> Dict:
         """
-        Smart Resolution: Finds the current month's Future token.
+        Fetches structural specs for NIFTY options for a given expiry.
         """
-        try:
-            # Filter for Futures of the underlying
-            futs = self.master_df[
-                (self.master_df['instrument_type'] == 'FUT') & 
-                (self.master_df['tradingsymbol'].str.startswith(underlying))
-            ].copy()
-            
-            if futs.empty:
-                return None
-            
-            # Sort by expiry
-            futs = futs.sort_values('expiry')
-            
-            # Find first expiry >= Today
-            today = pd.Timestamp.now().normalize()
-            valid_futs = futs[futs['expiry'] >= today]
-            
-            if valid_futs.empty:
-                return None
-                
-            return valid_futs.iloc[0]['instrument_key']
-            
-        except Exception as e:
-            logger.error(f"Future resolution failed: {e}")
-            return None
 
-# Global Singleton Instance
+        expiry_dt = pd.to_datetime(expiry)
+
+        df = self.master_df[
+            (self.master_df["segment"] == "NSE_FO") &
+            (self.master_df["underlying_symbol"] == "NIFTY") &
+            (self.master_df["instrument_type"].isin(["CE", "PE"])) &
+            (self.master_df["expiry"] == expiry_dt)
+        ]
+
+        if df.empty:
+            raise RuntimeError(f"No contracts found for expiry {expiry}")
+
+        row = df.iloc[0]
+
+        return {
+            "lot_size": int(row["lot_size"]),
+            "tick_size": float(row["tick_size"]),
+            "freeze_quantity": int(row["freeze_quantity"]),
+        }
+
+
+# GLOBAL SINGLETON
 registry = InstrumentRegistry()
