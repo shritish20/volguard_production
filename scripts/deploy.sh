@@ -19,18 +19,16 @@ if [ -z "$UPSTOX_ACCESS_TOKEN" ]; then
     echo "❌ UPSTOX_ACCESS_TOKEN not set"
     exit 1
 fi
-
 if [ -z "$POSTGRES_PASSWORD" ]; then
     echo "❌ POSTGRES_PASSWORD not set"
     exit 1
 fi
-
 echo "✅ Environment validated"
 
 # Create required directories
 echo ""
 echo "📁 Creating directories..."
-mkdir -p logs journal data
+mkdir -p logs journal data alembic/versions
 echo "✅ Directories created"
 
 # Run pre-flight checks
@@ -54,14 +52,12 @@ echo ""
 echo "⏳ Waiting for services to be healthy..."
 max_wait=60
 elapsed=0
-
 while [ $elapsed -lt $max_wait ]; do
     if docker-compose ps | grep -q "postgres.*healthy" && \
        docker-compose ps | grep -q "redis.*healthy"; then
         echo "✅ Services are healthy"
         break
     fi
-
     sleep 2
     elapsed=$((elapsed + 2))
     echo -n "."
@@ -76,13 +72,42 @@ fi
 
 # Run database migrations
 echo ""
-echo "🗄️  Running database migrations..."
+echo "🗄  Running database migrations..."
+
+# Check if migrations exist
+if [ ! -d "alembic/versions" ] || [ -z "$(ls -A alembic/versions)" ]; then
+    echo "⚠️  No migrations found. Creating initial migration..."
+    
+    # Generate initial migration inside container
+    docker-compose run --rm api alembic revision --autogenerate -m "Initial schema"
+    
+    if [ $? -ne 0 ]; then
+        echo "❌ Migration generation failed"
+        exit 1
+    fi
+    
+    echo "✅ Initial migration created"
+fi
+
+# Apply migrations
+echo "Applying migrations..."
 docker-compose run --rm api alembic upgrade head
+
 if [ $? -ne 0 ]; then
     echo "❌ Database migration failed"
+    echo "💡 Troubleshooting:"
+    echo "   1. Check if postgres is running: docker-compose ps postgres"
+    echo "   2. Check logs: docker-compose logs postgres"
+    echo "   3. Verify DATABASE_URL in .env"
     exit 1
 fi
+
 echo "✅ Database migrations complete"
+
+# Show current migration version
+echo ""
+echo "📊 Current database version:"
+docker-compose run --rm api alembic current
 
 # Start API service
 echo ""
@@ -94,13 +119,11 @@ echo ""
 echo "⏳ Waiting for API to be ready..."
 max_wait=30
 elapsed=0
-
 while [ $elapsed -lt $max_wait ]; do
     if curl -f -s http://localhost:8000/health > /dev/null 2>&1; then
         echo "✅ API is ready"
         break
     fi
-
     sleep 2
     elapsed=$((elapsed + 2))
     echo -n "."
@@ -120,7 +143,7 @@ curl -f -s http://localhost:8000/api/v1/supervisor/status > /dev/null
 if [ $? -eq 0 ]; then
     echo "✅ Supervisor status endpoint responding"
 else
-    echo "⚠️  Supervisor status endpoint not responding (may start later)"
+    echo "⚠️ Supervisor status endpoint not responding (may start later)"
 fi
 
 # Start supervisor
@@ -138,35 +161,36 @@ echo "📊 Service Status:"
 docker-compose ps
 echo ""
 echo "🔗 Important URLs:"
-echo "   • API Docs:       http://localhost:8000/docs"
-echo "   • Health Check:   http://localhost:8000/health"
-echo "   • Metrics:        http://localhost:8000/metrics"
-echo "   • Supervisor:     http://localhost:8000/api/v1/supervisor/status"
+echo "   • API Docs:      http://localhost:8000/docs"
+echo "   • Health Check:  http://localhost:8000/health"
+echo "   • Metrics:       http://localhost:8000/metrics"
+echo "   • Supervisor:    http://localhost:8000/api/v1/supervisor/status"
 echo ""
 echo "📝 Logs:"
-echo "   • View all logs:        docker-compose logs -f"
-echo "   • Supervisor logs:      docker-compose logs -f supervisor"
-echo "   • API logs:             docker-compose logs -f api"
-echo "   • Local logs:           tail -f logs/volguard_$(date +%Y%m%d).log"
+echo "   • View all logs:       docker-compose logs -f"
+echo "   • Supervisor logs:     docker-compose logs -f supervisor"
+echo "   • API logs:            docker-compose logs -f api"
+echo "   • Local logs:          tail -f logs/volguard_$(date +%Y%m%d).log"
 echo ""
-echo "🛠️  Management:"
-echo "   • Stop system:          docker-compose down"
-echo "   • Emergency stop:       python scripts/emergency_stop.py"
-echo "   • View positions:       curl http://localhost:8000/api/v1/dashboard/analyze"
+echo "🛠 Management:"
+echo "   • Stop system:         docker-compose down"
+echo "   • Emergency stop:      python scripts/emergency_stop.py"
+echo "   • View positions:      curl http://localhost:8000/api/v1/dashboard/analyze"
+echo "   • Manage Migrations:   ./scripts/manage_migrations.sh"
 echo ""
 
 # Display current mode
 if [ "$ENVIRONMENT" = "production_live" ]; then
-    echo "⚠️  ⚠️  ⚠️  WARNING ⚠️  ⚠️  ⚠️"
+    echo "⚠️ ⚠️ ⚠️  WARNING ⚠️ ⚠️ ⚠️"
     echo "System is running in FULL_AUTO mode with REAL MONEY"
-    echo "⚠️  ⚠️  ⚠️  WARNING ⚠️  ⚠️  ⚠️"
+    echo "⚠️ ⚠️ ⚠️  WARNING ⚠️ ⚠️ ⚠️"
 else
     echo "✅ System is running in $ENVIRONMENT mode"
 fi
 
 echo ""
 echo "📖 Next Steps:"
-echo "   1. Monitor logs: docker-compose logs -f supervisor"
-echo "   2. Watch metrics: watch -n 5 'curl -s http://localhost:8000/metrics | grep volguard'"
-echo "   3. Check positions: curl http://localhost:8000/api/v1/supervisor/status"
+echo "   1. Monitor logs:       docker-compose logs -f supervisor"
+echo "   2. Watch metrics:      watch -n 5 'curl -s http://localhost:8000/metrics | grep volguard'"
+echo "   3. Check positions:    curl http://localhost:8000/api/v1/supervisor/status"
 echo ""
