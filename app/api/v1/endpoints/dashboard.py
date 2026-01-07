@@ -178,7 +178,7 @@ async def analyze_market_state(
             # ====================================================
             # 3. ANALYTICS PIPELINE
             # ====================================================
-            vol = await vol_engine.calculate_volatility(nh, intra, spot, vix)
+            vol = await vol_engine.calculate_volatility(nh, intra, spot, vix, vix_history=vh)
             st = struct_engine.analyze_structure(wc, vol.spot, lot_size)
             ed = edge_engine.detect_edges(wc, mc, vol.spot, vol)
 
@@ -268,3 +268,4 @@ async def analyze_market_state(
                 else str(e)
             ),
     )
+
