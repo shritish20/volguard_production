@@ -1,10 +1,9 @@
-# app/main.py
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
+import asyncio
 from prometheus_client import make_asgi_app
 
 from app.config import settings
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """
     Lifespan manager for startup/shutdown.
-    This runs ONCE per worker.
+    Runs ONCE per worker.
     """
 
     # --------------------------------------------------
@@ -34,9 +33,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("✅ Database initialized")
 
-    # 2️⃣ Load Upstox Instrument Master (AUTHORITATIVE)
-    registry.load_master(force_refresh=False)
-    logger.info("✅ Instrument master loaded into registry")
+    # 2️⃣ Load Instrument Master (BLOCKING → THREAD SAFE)
+    try:
+        await asyncio.to_thread(registry.load_master, False)
+        logger.info("✅ Instrument master loaded into registry")
+    except Exception as e:
+        logger.critical("❌ Failed to load instrument master", exc_info=True)
+        raise RuntimeError("Startup aborted: Instrument master unavailable") from e
 
     yield  # 👈 Application is now LIVE
 
@@ -61,10 +64,10 @@ def create_app() -> FastAPI:
     # --------------------------------------------------
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[""],  # tighten in prod
+        allow_origins=["*"],   # tighten later if needed
         allow_credentials=True,
-        allow_methods=[""],
-        allow_headers=[""],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     # --------------------------------------------------
