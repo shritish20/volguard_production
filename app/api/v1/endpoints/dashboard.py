@@ -1,10 +1,9 @@
-# app/api/v1/endpoints/dashboard.py
-
 from fastapi import APIRouter, HTTPException, Depends, Request
 from datetime import datetime
 import asyncio
 import logging
 import math
+import pandas as pd
 
 from app.dependencies import get_market_client, get_persistence_service
 from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
@@ -12,7 +11,7 @@ from app.services.persistence import PersistenceService
 from app.services.cache import cache
 from app.config import settings
 
-# 🔑 AUTHORITATIVE REGISTRY
+# 🔑 AUTHORITATIVE REGISTRY (LOADED AT STARTUP)
 from app.services.instrument_registry import registry
 
 # Core Analytics Engines
@@ -23,15 +22,21 @@ from app.core.analytics.regime import RegimeEngine
 
 # Schemas
 from app.schemas.analytics import (
-    FullAnalysisResponse, VolatilityDashboard, EdgeDashboard, 
-    StructureDashboard, ScoresDashboard, CapitalDashboard, MetricItem, ExtMetrics
+    FullAnalysisResponse,
+    VolatilityDashboard,
+    EdgeDashboard,
+    StructureDashboard,
+    ScoresDashboard,
+    CapitalDashboard,
+    MetricItem,
+    ExtMetrics,
 )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# VALIDATION HELPERS
+# VALIDATION & SANITIZATION
 # ============================================================
 
 def is_valid_float(val):
@@ -116,10 +121,11 @@ async def analyze_market_state(
     start_time = asyncio.get_event_loop().time()
     cache_key = f"dashboard:analysis:{datetime.now().strftime('%Y%m%d%H%M')}"
 
+    # ---------------- CACHE ----------------
     try:
         cached = await cache.get(cache_key)
         if cached:
-            logger.info("Cache hit")
+            logger.info("Dashboard cache hit")
             return FullAnalysisResponse.parse_raw(cached)
     except Exception:
         pass
@@ -134,7 +140,7 @@ async def analyze_market_state(
         async with asyncio.timeout(30):
 
             # ====================================================
-            # 1. FETCH AUTHORITATIVE STRUCTURE (REGISTRY)
+            # 1. AUTHORITATIVE STRUCTURE (REGISTRY)
             # ====================================================
             weekly_expiry, monthly_expiry = registry.get_nifty_expiries()
             specs = registry.get_nifty_contract_specs(weekly_expiry)
@@ -148,7 +154,11 @@ async def analyze_market_state(
             intra_task = market.get_intraday_candles(NIFTY_KEY)
             live_task = market.get_live_quote([NIFTY_KEY, VIX_KEY])
             wc_task = market.get_option_chain(weekly_expiry)
-            mc_task = market.get_option_chain(monthly_expiry)
+
+            if monthly_expiry != weekly_expiry:
+                mc_task = market.get_option_chain(monthly_expiry)
+            else:
+                mc_task = asyncio.sleep(0, result=pd.DataFrame())
 
             nh, vh, intra, live, wc, mc = await asyncio.gather(
                 nh_task, vh_task, intra_task, live_task, wc_task, mc_task
@@ -160,7 +170,7 @@ async def analyze_market_state(
                 vh = await market.get_daily_candles(VIX_KEY)
 
             if nh.empty or wc.empty:
-                raise HTTPException(status_code=500, detail="Critical data missing")
+                raise HTTPException(status_code=500, detail="Critical market data missing")
 
             spot = live.get(NIFTY_KEY, 0.0)
             vix = live.get(VIX_KEY, 0.0)
@@ -216,11 +226,11 @@ async def analyze_market_state(
                 ),
 
                 scores=ScoresDashboard(
-                    vol_score=sanitize_float(reg.v_scr),
-                    struct_score=sanitize_float(reg.s_scr),
-                    edge_score=sanitize_float(reg.e_scr),
-                    risk_score=sanitize_float(reg.r_scr),
-                    total_score=sanitize_float(reg.score),
+                    vol_score=sanitize_float(reg.v_scr, 0.0, "vol_score"),
+                    struct_score=sanitize_float(reg.s_scr, 0.0, "struct_score"),
+                    edge_score=sanitize_float(reg.e_scr, 0.0, "edge_score"),
+                    risk_score=sanitize_float(reg.r_scr, 0.0, "risk_score"),
+                    total_score=sanitize_float(reg.score, 0.0, "total_score"),
                 ),
 
                 external={"fast_vol": False},
@@ -228,9 +238,12 @@ async def analyze_market_state(
                 capital=CapitalDashboard(
                     regime_name=reg.name,
                     primary_edge=reg.primary_edge,
-                    allocation_pct=sanitize_float(reg.alloc_pct),
-                    max_lots=int(sanitize_float(reg.max_lots)),
-                    recommendation=f"Allocate {reg.alloc_pct*100:.0f}% Capital ({int(reg.max_lots)} lots)",
+                    allocation_pct=sanitize_float(reg.alloc_pct, 0.0, "alloc_pct"),
+                    max_lots=int(sanitize_float(reg.max_lots, 0, "max_lots")),
+                    recommendation=(
+                        f"Allocate {reg.alloc_pct*100:.0f}% Capital "
+                        f"({int(reg.max_lots)} lots)"
+                    ),
                 ),
             )
 
@@ -246,10 +259,12 @@ async def analyze_market_state(
         raise HTTPException(status_code=504, detail="Analysis timeout")
 
     except Exception as e:
-        logger.error(f"Dashboard failure: {e}", exc_info=True)
+        logger.error("Dashboard failure", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="Market analysis temporarily unavailable"
-            if settings.ENVIRONMENT.startswith("production")
-            else str(e),
-            )
+            detail=(
+                "Market analysis temporarily unavailable"
+                if settings.ENVIRONMENT.startswith("production")
+                else str(e)
+            ),
+    )
