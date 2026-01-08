@@ -1,271 +1,266 @@
-from fastapi import APIRouter, HTTPException, Depends, Request
-from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from typing import Dict, Any
+from datetime import date, datetime
 import asyncio
-import logging
-import math
 import pandas as pd
 
-from app.dependencies import get_market_client, get_persistence_service
-from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
-from app.services.persistence import PersistenceService
-from app.services.cache import cache
-from app.config import settings
-
-# 🔑 AUTHORITATIVE REGISTRY (LOADED AT STARTUP)
-from app.services.instrument_registry import registry
-
-# Core Analytics Engines
+# 1. The Brains (Engines)
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.structure import StructureEngine
 from app.core.analytics.edge import EdgeEngine
 from app.core.analytics.regime import RegimeEngine
+from app.core.market.participant_client import ParticipantClient
 
-# Schemas
-from app.schemas.analytics import (
-    FullAnalysisResponse,
-    VolatilityDashboard,
-    EdgeDashboard,
-    StructureDashboard,
-    ScoresDashboard,
-    CapitalDashboard,
-    MetricItem,
-    ExtMetrics,
-)
+# 2. The Data Sources
+from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
+from app.services.instrument_registry import registry 
+from app.dependencies import get_market_client
+
+# 3. Utils
+from app.utils.logger import logger
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
-# ============================================================
-# VALIDATION & SANITIZATION
-# ============================================================
+# Initialize Engines (Singletons)
+# These hold the logic (Kill Switch, Weighted VRP, GEX Filters)
+vol_engine = VolatilityEngine()
+struct_engine = StructureEngine()
+edge_engine = EdgeEngine()
+regime_engine = RegimeEngine()
+participant_client = ParticipantClient()
 
-def is_valid_float(val):
-    if not isinstance(val, (int, float)):
-        return True
-    return not (math.isinf(val) or math.isnan(val))
-
-
-def sanitize_float(val, default=0.0, field_name="unknown"):
-    if not isinstance(val, (int, float)):
-        return val
-    if math.isinf(val) or math.isnan(val):
-        logger.error(f"Invalid calculation detected for {field_name}: {val}")
-        return default
-    return val
-
-
-def get_tag_meta(val, type_):
-    if type_ == "IVP":
-        if val < 20: return "CHEAP", "green"
-        if val > 80: return "RICH", "red"
-        return "FAIR", "default"
-    if type_ == "VRP":
-        if val > 3.0: return "HIGH", "green"
-        if val < 0.0: return "LOW", "red"
-        return "OK", "default"
-    if type_ == "VOV":
-        return ("HIGH", "red") if val > 100 else ("STABLE", "default")
-    if type_ == "TERM":
-        return ("INV", "red") if val < -1.5 else ("NRML", "green")
-    if type_ == "SKEW":
-        if val > 5: return "HIGH", "orange"
-        if val < -5: return "LOW", "blue"
-        return "NEUTRAL", "default"
-    return "-", "default"
-
-
-def mk_item(val, type_tag=None, suffix="", field_name="metric"):
-    if isinstance(val, (int, float)):
-        val = sanitize_float(val, 0.0, field_name)
-        formatted = f"{val:.2f}{suffix}"
-    else:
-        formatted = str(val)
-
-    tag, color = (
-        get_tag_meta(val, type_tag)
-        if type_tag and isinstance(val, (int, float))
-        else ("-", "default")
-    )
-
-    return MetricItem(value=val, formatted=formatted, tag=tag, color=color)
-
-
-def validate_response_data(vol, st, ed, reg):
-    error_fields = []
-
-    critical = [
-        (vol.spot, "spot"),
-        (vol.vix, "vix"),
-        (ed.term_structure, "term_structure"),
-        (st.net_gex, "net_gex"),
-        (reg.score, "total_score"),
-        (reg.alloc_pct, "alloc_pct"),
-    ]
-
-    for val, name in critical:
-        if not is_valid_float(val):
-            error_fields.append(name)
-
-    return len(error_fields) == 0, error_fields
-
-# ============================================================
-# MAIN ENDPOINT
-# ============================================================
-
-@router.post("/analyze", response_model=FullAnalysisResponse)
-async def analyze_market_state(
-    request: Request,
-    market: MarketDataClient = Depends(get_market_client),
-    db: PersistenceService = Depends(get_persistence_service),
+@router.get("/analysis", response_model=Dict[str, Any])
+async def get_market_analysis(
+    market: MarketDataClient = Depends(get_market_client)
 ):
-    start_time = asyncio.get_event_loop().time()
-    cache_key = f"dashboard:analysis:{datetime.now().strftime('%Y%m%d%H%M')}"
-
-    # ---------------- CACHE ----------------
+    """
+    VolGuard 4.1 Master Dashboard.
+    Returns the complete 360-degree view (Weekly vs Monthly) matching the v30.1 Script.
+    """
     try:
-        cached = await cache.get(cache_key)
-        if cached:
-            logger.info("Dashboard cache hit")
-            return FullAnalysisResponse.parse_raw(cached)
-    except Exception:
-        pass
+        logger.info("Starting VolGuard 4.1 Market Analysis...")
+        start_time = datetime.now()
 
-    # Initialize Engines
-    vol_engine = VolatilityEngine()
-    struct_engine = StructureEngine()
-    edge_engine = EdgeEngine()
-    regime_engine = RegimeEngine()
+        # ==================================================================
+        # 1. FETCH AUTHORITATIVE EXPIRIES (FROM REGISTRY)
+        # ==================================================================
+        # This uses the Instrument Master you downloaded from Upstox
+        # It ensures the dashboard sees the exact same contracts as the execution engine
+        weekly_exp, monthly_exp = registry.get_nifty_expiries()
+        
+        if not weekly_exp or not monthly_exp:
+            # Fallback if registry isn't fully loaded yet (e.g. startup)
+            today = date.today()
+            logger.warning("Registry not ready, using fallback dates")
+            weekly_exp = today
+            monthly_exp = today
 
-    try:
-        async with asyncio.timeout(30):
+        # Get Contract Specs (Lot Size) to ensure GEX calc is accurate
+        specs = registry.get_nifty_contract_specs(weekly_exp)
+        lot_size = specs.get("lot_size", 50)
 
-            # ====================================================
-            # 1. AUTHORITATIVE STRUCTURE (REGISTRY)
-            # ====================================================
-            weekly_expiry, monthly_expiry = registry.get_nifty_expiries()
-            specs = registry.get_nifty_contract_specs(weekly_expiry)
-            lot_size = specs["lot_size"]
+        # Calculate DTEs
+        today_date = date.today()
+        dte_w = (weekly_exp - today_date).days
+        dte_m = (monthly_exp - today_date).days
 
-            # ====================================================
-            # 2. PARALLEL DATA FETCH
-            # ====================================================
-            nh_task = db.load_daily_history(NIFTY_KEY, days=365)
-            vh_task = db.load_daily_history(VIX_KEY, days=365)
-            intra_task = market.get_intraday_candles(NIFTY_KEY)
-            live_task = market.get_live_quote([NIFTY_KEY, VIX_KEY])
-            wc_task = market.get_option_chain(weekly_expiry)
+        # ==================================================================
+        # 2. PARALLEL DATA FETCHING (ASYNC)
+        # ==================================================================
+        # We fetch NSE flow, Historical Data, and Option Chains simultaneously
+        
+        # A. Market Data Tasks (Upstox)
+        hist_task = market.get_daily_candles(NIFTY_KEY, days=400)
+        vix_task = market.get_daily_candles(VIX_KEY, days=400)
+        live_task = market.get_live_quote([NIFTY_KEY, VIX_KEY])
+        
+        # B. Option Chain Tasks (Specific Expiries)
+        chain_w_task = market.get_option_chain(weekly_exp.strftime("%Y-%m-%d"))
+        chain_m_task = market.get_option_chain(monthly_exp.strftime("%Y-%m-%d"))
+        
+        # C. Participant Data Task (NSE Scraper - Async Wrapper)
+        fii_task = participant_client.fetch_metrics()
 
-            if monthly_expiry != weekly_expiry:
-                mc_task = market.get_option_chain(monthly_expiry)
-            else:
-                mc_task = asyncio.sleep(0, result=pd.DataFrame())
+        # Execute parallel wait
+        nifty_hist, vix_hist, live_data, chain_w, chain_m, ext_metrics = await asyncio.gather(
+            hist_task, vix_task, live_task, chain_w_task, chain_m_task, fii_task
+        )
 
-            nh, vh, intra, live, wc, mc = await asyncio.gather(
-                nh_task, vh_task, intra_task, live_task, wc_task, mc_task
-            )
+        # ==================================================================
+        # 3. ANALYTICAL PIPELINE
+        # ==================================================================
+        
+        # A. Volatility (Global)
+        # Calculates VoV Z-Score, GARCH, Parkinson, and Kill Switch
+        spot = live_data.get(NIFTY_KEY, 0)
+        vix = live_data.get(VIX_KEY, 0)
+        
+        # Note: Vol engine runs heavy math in a thread
+        vol_metrics = await vol_engine.analyze(nifty_hist, vix_hist, spot, vix)
 
-            if nh.empty:
-                nh = await market.get_daily_candles(NIFTY_KEY)
-            if vh.empty:
-                vh = await market.get_daily_candles(VIX_KEY)
+        # B. Structure (Weekly vs Monthly)
+        # Calculates Net GEX, Max Pain, PCR, and Sticky/Slippery Regimes
+        struct_w = struct_engine.calculate_structure(chain_w, spot, lot_size)
+        struct_m = struct_engine.calculate_structure(chain_m, spot, lot_size)
 
-            if nh.empty or wc.empty:
-                raise HTTPException(status_code=500, detail="Critical market data missing")
+        # C. Edges (Global)
+        # Calculates Weighted VRP (70/15/15) and Term Structure
+        edge_metrics = edge_engine.calculate_edge(vol_metrics, chain_w, chain_m)
 
-            spot = live.get(NIFTY_KEY, 0.0)
-            vix = live.get(VIX_KEY, 0.0)
+        # D. Regime Scoring (The "Brain")
+        # We run the regime engine twice to get distinct mandates for different horizons
+        
+        # Weekly Mandate (Gamma Focus)
+        weekly_mandate = regime_engine.analyze_regime(
+            vol_metrics, struct_w, edge_metrics, ext_metrics, "WEEKLY", dte_w
+        )
+        
+        # Monthly Mandate (Vega Focus)
+        monthly_mandate = regime_engine.analyze_regime(
+            vol_metrics, struct_m, edge_metrics, ext_metrics, "MONTHLY", dte_m
+        )
 
-            # ====================================================
-            # 3. ANALYTICS PIPELINE
-            # ====================================================
-            vol = await vol_engine.calculate_volatility(nh, intra, spot, vix, vix_history=vh)
-            st = struct_engine.analyze_structure(wc, vol.spot, lot_size)
-            ed = edge_engine.detect_edges(wc, mc, vol.spot, vol)
+        # ==================================================================
+        # 4. CONSTRUCT THE "GOD VIEW" RESPONSE
+        # ==================================================================
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        response = {
+            "meta": {
+                "version": "VolGuard 4.1",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "analysis_time_sec": round(elapsed, 2),
+                "data_source": "Upstox V3 + NSE Live",
+                "status": "ONLINE"
+            },
+            
+            # --- 1. TIME CONTEXT ---
+            "time_context": {
+                "current_date": str(today_date),
+                "weekly_expiry": str(weekly_exp),
+                "monthly_expiry": str(monthly_exp),
+                "dte_weekly": dte_w,
+                "dte_monthly": dte_m,
+                "is_gamma_danger": dte_w <= 1
+            },
 
-            ext = ExtMetrics(fii=0, dii=0, events=0, event_names=[], fast_vol=False)
-            reg = regime_engine.calculate_regime(vol, st, ed, ext)
+            # --- 2. VOLATILITY ANALYSIS (The Kill Switch) ---
+            "volatility": {
+                "spot": vol_metrics.spot,
+                "vix": vol_metrics.vix,
+                "trend_strength": round(vol_metrics.trend_strength, 2),
+                "metrics": {
+                    "vov_zscore": round(vol_metrics.vov_zscore, 2), # <--- Primary Filter
+                    "ivp_30d": round(vol_metrics.ivp_30d, 1),
+                    "ivp_1yr": round(vol_metrics.ivp_1yr, 1),
+                    "rv_7d": round(vol_metrics.rv7, 1),
+                    "garch_7d": round(vol_metrics.garch7, 1),
+                    "parkinson_7d": round(vol_metrics.park7, 1)
+                },
+                "regime": vol_metrics.vol_regime, # EXPLODING / RICH / CHEAP
+                "kill_switch_active": vol_metrics.vov_zscore > 2.5
+            },
 
-            is_valid, errors = validate_response_data(vol, st, ed, reg)
+            # --- 3. PARTICIPANT DATA (FII FLOW) ---
+            "external_flow": {
+                "flow_regime": ext_metrics.flow_regime, # STRONG_SHORT / LONG
+                "event_risk": ext_metrics.event_risk,   # HIGH / LOW (Manual Calendar)
+                "fii_net_change": ext_metrics.fii_net_change,
+                "positions": {
+                    "FII": _format_participant(ext_metrics.fii),
+                    "DII": _format_participant(ext_metrics.dii),
+                    "PRO": _format_participant(ext_metrics.pro),
+                    "CLIENT": _format_participant(ext_metrics.client)
+                }
+            },
 
-            # ====================================================
-            # 4. RESPONSE
-            # ====================================================
-            result = FullAnalysisResponse(
-                timestamp=datetime.now(),
+            # --- 4. MARKET STRUCTURE (WEEKLY vs MONTHLY) ---
+            "market_structure": {
+                "weekly": {
+                    "net_gex_cr": round(struct_w.net_gex / 10000000, 2),
+                    "gex_regime": struct_w.gex_regime,
+                    "pcr": round(struct_w.pcr, 2),
+                    "max_pain": struct_w.max_pain,
+                    "skew": round(struct_w.skew_25d, 2)
+                },
+                "monthly": {
+                    "net_gex_cr": round(struct_m.net_gex / 10000000, 2),
+                    "gex_regime": struct_m.gex_regime,
+                    "pcr": round(struct_m.pcr, 2),
+                    "max_pain": struct_m.max_pain
+                }
+            },
 
-                volatility=VolatilityDashboard(
-                    spot=mk_item(vol.spot, field_name="spot"),
-                    vix=mk_item(vol.vix, "IVP", field_name="vix"),
-                    vov=mk_item(vol.vov, "VOV", "%", field_name="vov"),
-                    ivp_30=mk_item(vol.ivp30, "IVP", "%", field_name="ivp30"),
-                    ivp_90=mk_item(vol.ivp90, "IVP", "%", field_name="ivp90"),
-                    ivp_1y=mk_item(vol.ivp1y, "IVP", "%", field_name="ivp1y"),
-                    rv_7_28=mk_item(vol.rv7, field_name="rv7"),
-                    garch_7_28=mk_item(vol.garch7, field_name="garch7"),
-                    parkinson_7_28=mk_item(vol.pk7, field_name="pk7"),
-                    is_fallback=vol.is_fallback,
-                ),
+            # --- 5. OPTION EDGES (Weighted VRP) ---
+            "edges": {
+                "term_structure": edge_metrics.term_regime, # BACKWARDATION / CONTANGO
+                "term_spread": round(edge_metrics.term_spread, 2),
+                "weekly_edge": {
+                    "atm_iv": round(edge_metrics.iv_weekly, 2),
+                    "weighted_vrp": round(edge_metrics.vrp_weighted_weekly, 2),
+                    "raw_vrp_garch": round(edge_metrics.vrp_garch_weekly, 2)
+                },
+                "monthly_edge": {
+                    "atm_iv": round(edge_metrics.iv_monthly, 2),
+                    "weighted_vrp": round(edge_metrics.vrp_weighted_monthly, 2)
+                },
+                "primary_opportunity": edge_metrics.primary_edge
+            },
 
-                edges=EdgeDashboard(
-                    iv_weekly=mk_item(ed.iv_weekly, "%", field_name="iv_weekly"),
-                    iv_monthly=mk_item(ed.iv_monthly, "%", field_name="iv_monthly"),
-                    vrp_rv_w=mk_item(ed.vrp_rv_w, "VRP"),
-                    vrp_rv_m=mk_item(ed.vrp_rv_m, "VRP"),
-                    vrp_ga_w=mk_item(ed.vrp_garch_w, "VRP"),
-                    vrp_ga_m=mk_item(ed.vrp_garch_m, "VRP"),
-                    vrp_pk_w=mk_item(ed.vrp_pk_w, "VRP"),
-                    vrp_pk_m=mk_item(ed.vrp_pk_m, "VRP"),
-                    term_structure=mk_item(ed.term_structure, "TERM"),
-                ),
+            # --- 6. TRADING MANDATES (THE OUTPUT) ---
+            "mandates": {
+                "WEEKLY": {
+                    "regime": weekly_mandate.regime_name,
+                    "strategy": weekly_mandate.strategy_type,
+                    "allocation": f"{weekly_mandate.allocation_pct}%",
+                    "max_lots": weekly_mandate.max_lots,
+                    "rationale": weekly_mandate.rationale,
+                    "warnings": weekly_mandate.warnings
+                },
+                "MONTHLY": {
+                    "regime": monthly_mandate.regime_name,
+                    "strategy": monthly_mandate.strategy_type,
+                    "allocation": f"{monthly_mandate.allocation_pct}%",
+                    "max_lots": monthly_mandate.max_lots,
+                    "rationale": monthly_mandate.rationale
+                }
+            },
+            
+            # --- 7. COMPARATIVE SUMMARY ---
+            "recommendation": _generate_recommendation(weekly_mandate, monthly_mandate)
+        }
 
-                structure=StructureDashboard(
-                    net_gex=mk_item(st.net_gex),
-                    pcr=mk_item(st.pcr),
-                    max_pain=mk_item(st.max_pain),
-                    skew_25d=mk_item(st.skew, "SKEW", "%"),
-                ),
-
-                scores=ScoresDashboard(
-                    vol_score=sanitize_float(reg.v_scr, 0.0, "vol_score"),
-                    struct_score=sanitize_float(reg.s_scr, 0.0, "struct_score"),
-                    edge_score=sanitize_float(reg.e_scr, 0.0, "edge_score"),
-                    risk_score=sanitize_float(reg.r_scr, 0.0, "risk_score"),
-                    total_score=sanitize_float(reg.score, 0.0, "total_score"),
-                ),
-
-                external={"fast_vol": False},
-
-                capital=CapitalDashboard(
-                    regime_name=reg.name,
-                    primary_edge=reg.primary_edge,
-                    allocation_pct=sanitize_float(reg.alloc_pct, 0.0, "alloc_pct"),
-                    max_lots=int(sanitize_float(reg.max_lots, 0, "max_lots")),
-                    recommendation=(
-                        f"Allocate {reg.alloc_pct*100:.0f}% Capital "
-                        f"({int(reg.max_lots)} lots)"
-                    ),
-                ),
-            )
-
-            if is_valid:
-                await cache.set(cache_key, result.json(), ttl=60)
-
-            elapsed = asyncio.get_event_loop().time() - start_time
-            logger.info(f"Analysis completed in {elapsed*1000:.0f}ms")
-
-            return result
-
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Analysis timeout")
+        return response
 
     except Exception as e:
-        logger.error("Dashboard failure", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Market analysis temporarily unavailable"
-                if settings.ENVIRONMENT.startswith("production")
-                else str(e)
-            ),
-    )
+        logger.error(f"Dashboard Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
+# ==================================================================
+# HELPER FUNCTIONS (Formatting & logic)
+# ==================================================================
+
+def _format_participant(data):
+    if not data: return None
+    return {
+        "fut_net": data.fut_net,
+        "call_net": data.call_net,
+        "put_net": data.put_net,
+        "bias": "BULLISH" if data.fut_net > 0 else "BEARISH"
+    }
+
+def _generate_recommendation(weekly, monthly):
+    """Simple logic to pick the winner based on allocation Score"""
+    # If both are CASH, stay out
+    if weekly.regime_name == "CASH" and monthly.regime_name == "CASH":
+        return "STAY CASH: No favorable regime found."
+    
+    # Pick the higher allocation
+    if weekly.allocation_pct >= monthly.allocation_pct:
+        winner = "WEEKLY"
+        score = weekly.allocation_pct
+    else:
+        winner = "MONTHLY" 
+        score = monthly.allocation_pct
+        
+    return f"FOCUS ON {winner} ({score}% Allocation). {weekly.regime_name} vs {monthly.regime_name}."
