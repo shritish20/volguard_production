@@ -1,15 +1,14 @@
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, date
 import pandas as pd
 import numpy as np
 
 from app.config import settings
 from app.services.instrument_registry import registry
-from app.core.trading.leg_builder import LegBuilder # Kept for utility, but logic moved here
 from app.schemas.analytics import VolMetrics
 
-# For typing, we use a forward reference or Any if Mandate isn't in schemas yet
+# For typing, we use a forward reference for TradingMandate
 from typing import Any 
 
 logger = logging.getLogger(__name__)
@@ -17,13 +16,14 @@ logger = logging.getLogger(__name__)
 class TradingEngine:
     """
     VolGuard 4.1 Execution Engine.
-    The "Hands" of the system. Executes the Mandate provided by the Brain (RegimeEngine).
+    The "Hands" of the system. Executes the Mandate provided by the Brain.
+    
+    UPGRADE: Uses Registry for Dynamic Lot Sizing.
     """
 
     def __init__(self, market_client, config: Dict):
         self.client = market_client
         self.config = config
-        self.builder = LegBuilder() 
 
     async def generate_entry_orders(
         self,
@@ -83,14 +83,9 @@ class TradingEngine:
     # =================================================================
 
     def _build_strangle(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
-        """
-        Aggressive Short: Sell OTM Call + Sell OTM Put.
-        Target: ~15 Delta or 1 StdDev OTM.
-        """
+        """Aggressive Short: Sell OTM Call + Sell OTM Put."""
         spot = snapshot['spot']
-        
-        # Dynamic Width based on Volatility (ATR)
-        # Higher Vol = Wider Strangle
+        # Dynamic Width: Higher Vol = Wider Strangle
         width_mult = 1.0 if vol.ivp_1yr < 50 else 1.2
         range_pts = (vol.atr14 * 2.0) * width_mult
         
@@ -103,59 +98,42 @@ class TradingEngine:
         return [x for x in [ce_leg, pe_leg] if x]
 
     def _build_iron_condor(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
-        """
-        Moderate Short: Sell OTM Strangle + Buy Wings for protection.
-        """
+        """Moderate Short: Sell OTM Strangle + Buy Wings."""
         spot = snapshot['spot']
-        range_pts = vol.atr14 * 1.5 # Tighter than strangle
-        wing_width = 200 # Fixed width or ATR based
+        range_pts = vol.atr14 * 1.5
+        wing_width = 200 # Could be dynamic based on strike availability
         
-        # Short Strikes
+        # Strikes
         short_ce_target = spot + range_pts
         short_pe_target = spot - range_pts
-        
-        # Long Strikes (Wings)
         long_ce_target = short_ce_target + wing_width
         long_pe_target = short_pe_target - wing_width
 
         orders = []
         orders.append(self._find_strike(chain, "CE", short_ce_target, "SHORT", mandate.max_lots))
         orders.append(self._find_strike(chain, "PE", short_pe_target, "SHORT", mandate.max_lots))
-        orders.append(self._find_strike(chain, "CE", long_ce_target, "LONG", mandate.max_lots)) # Hedge
-        orders.append(self._find_strike(chain, "PE", long_pe_target, "LONG", mandate.max_lots)) # Hedge
+        orders.append(self._find_strike(chain, "CE", long_ce_target, "LONG", mandate.max_lots))
+        orders.append(self._find_strike(chain, "PE", long_pe_target, "LONG", mandate.max_lots))
         
         return [x for x in orders if x]
 
     def _build_iron_fly(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
-        """
-        Theta Play: Sell ATM Straddle + Buy Wings.
-        Used when DTE is low (Weekly).
-        """
+        """Theta Play: Sell ATM Straddle + Buy Wings."""
         spot = snapshot['spot']
-        # Wing width proportional to expected move
         wing_width = vol.atr14 * 1.0 
 
         orders = []
-        # Sell ATM
         orders.append(self._find_strike(chain, "CE", spot, "SHORT", mandate.max_lots))
         orders.append(self._find_strike(chain, "PE", spot, "SHORT", mandate.max_lots))
-        # Buy Wings
         orders.append(self._find_strike(chain, "CE", spot + wing_width, "LONG", mandate.max_lots))
         orders.append(self._find_strike(chain, "PE", spot - wing_width, "LONG", mandate.max_lots))
 
         return [x for x in orders if x]
 
     def _build_credit_spread(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
-        """
-        Defensive: Directional Credit Spread based on Trend.
-        """
+        """Defensive: Directional Credit Spread."""
         spot = snapshot['spot']
-        ma20 = vol.trend_strength * vol.atr14 # Heuristic to recover MA20 proxy logic if needed
-        # Or simpler: check mandate warnings/rationale for direction? 
-        # For now, we default to Bull Put Spread (neutral/bullish bias) 
-        # unless market is crashing.
-        
-        is_bearish = vol.vov_zscore > 1.0 # Simple filter
+        is_bearish = vol.vov_zscore > 1.0 or vol.trend_strength < 1.0 # Simple heuristics
         
         orders = []
         if is_bearish:
@@ -179,7 +157,7 @@ class TradingEngine:
 
     def _find_strike(self, chain: pd.DataFrame, opt_type: str, price_target: float, side: str, lots: int) -> Optional[Dict]:
         """
-        Finds the specific contract in the chain closest to the target price.
+        Finds the specific contract and calculates quantity based on Registry Lot Size.
         """
         try:
             # Filter by type
@@ -189,8 +167,17 @@ class TradingEngine:
             # Find closest strike
             subset['diff'] = abs(subset['strike'] - price_target)
             best_row = subset.nsmallest(1, 'diff').iloc[0]
+            
+            expiry_date = best_row['expiry'] # Already date object from client or string
 
-            # Build Order Dict (compatible with TradeExecutor)
+            # -----------------------------------------------------------
+            # CRITICAL FIX: GET REAL LOT SIZE FROM REGISTRY
+            # -----------------------------------------------------------
+            specs = registry.get_nifty_contract_specs(expiry_date)
+            lot_size = specs.get("lot_size", 50)
+            quantity = lots * lot_size
+            # -----------------------------------------------------------
+
             return {
                 "instrument_key": best_row['instrument_key'],
                 "symbol": best_row['trading_symbol'],
@@ -198,7 +185,7 @@ class TradingEngine:
                 "option_type": opt_type,
                 "expiry_date": best_row['expiry'],
                 "side": "SELL" if side == "SHORT" else "BUY",
-                "quantity": lots * 50, # Lot size hardcoded or fetch from registry if available
+                "quantity": quantity,
                 "order_type": "MARKET",
                 "product": "I", # Intraday/Margin
                 "strategy": "ALGO_ENTRY",
@@ -211,16 +198,13 @@ class TradingEngine:
     async def _resolve_expiry(self, expiry_type: str) -> Optional[date]:
         """Gets authoritative expiry from Registry."""
         weekly, monthly = registry.get_nifty_expiries()
-        
         if expiry_type == "WEEKLY":
             return weekly
         elif expiry_type == "MONTHLY":
             return monthly
-        
-        # Fallback
         return weekly
 
-    # Legacy method for compatibility if Supervisor calls it directly
+    # Helper for Supervisor
     async def _get_best_expiry_chain(self, symbol="NIFTY") -> Tuple[Optional[date], Optional[pd.DataFrame]]:
         weekly, _ = registry.get_nifty_expiries()
         if not weekly: return None, None
