@@ -1,245 +1,186 @@
-# app/core/analytics/volatility.py
-
 import numpy as np
 import pandas as pd
-import logging
-import time
-import asyncio
-import math
 from arch import arch_model
+from scipy import stats
+import asyncio
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+# We use the internal logger to keep production monitoring happy
+from app.utils.logger import logger 
 
-# =============================================================================
-# DATA STRUCTURE
-# =============================================================================
 @dataclass
 class VolMetrics:
     spot: float
-    iv: float
-    vov: float
-    regime: str
-
-    ivp30: float
-    ivp90: float
-    ivp1y: float
-
+    vix: float
+    # Realized Volatility
     rv7: float
     rv28: float
-
+    rv90: float
+    # Forecast & Intraday
     garch7: float
     garch28: float
+    park7: float
+    park28: float
+    # The "Holy Grail" Filters
+    vov: float
+    vov_zscore: float  # <--- The Kill Switch Metric
+    # Context
+    ivp_30d: float
+    ivp_90d: float
+    ivp_1yr: float
+    trend_strength: float
+    vol_regime: str
+    is_fallback: bool
 
-    pk7: float
-    pk28: float
-
-    is_fallback: bool = False
-
-
-# =============================================================================
-# ENGINE
-# =============================================================================
 class VolatilityEngine:
     """
-    Production-safe volatility engine.
-    NO assumptions.
-    NO silent NaNs.
+    VolGuard 4.1 Volatility Engine.
+    Powered by v30.1 Logic: VoV Z-Score & Weighted VRP Inputs.
     """
 
-    def __init__(self, garch_interval_seconds: int = 1800):
-        self.garch_interval = garch_interval_seconds
-        self._last_garch_time = 0.0
-        self._cached_garch7 = np.nan
-        self._cached_garch28 = np.nan
+    def __init__(self):
+        self.risk_free_rate = 0.07  # India 10Y ~7%
 
-    # -------------------------------------------------------------------------
-    # MAIN ENTRY
-    # -------------------------------------------------------------------------
-    async def calculate_volatility(
-        self,
-        history_candles: pd.DataFrame,
-        intraday_candles: pd.DataFrame,
-        spot_price: float,
-        vix_current: float,
-        vix_history: pd.DataFrame,
-    ) -> VolMetrics:
-
+    async def analyze(self, 
+                      nifty_hist: pd.DataFrame, 
+                      vix_hist: pd.DataFrame, 
+                      spot_live: float, 
+                      vix_live: float) -> VolMetrics:
+        """
+        Main entry point. Runs heavy math in a thread to prevent blocking the event loop.
+        """
         try:
-            # -----------------------------
-            # VALIDATION
-            # -----------------------------
-            if not math.isfinite(spot_price) or spot_price <= 0:
-                if not history_candles.empty:
-                    spot_price = float(history_candles.iloc[-1]["close"])
-                else:
-                    spot_price = 0.0
-
-            if not math.isfinite(vix_current):
-                vix_current = 0.0
-
-            is_fallback = spot_price <= 0
-
-            if history_candles.empty:
-                return self._default(spot_price, vix_current)
-
-            # -----------------------------
-            # CLEAN DAILY CLOSES
-            # -----------------------------
-            closes = history_candles["close"].replace([0, np.inf, -np.inf], np.nan)
-            closes = closes.dropna()
-            closes = closes[closes > 0]
-
-            if len(closes) < 30:
-                return self._default(spot_price, vix_current)
-
-            returns = np.log(closes / closes.shift(1)).dropna()
-
-            if len(returns) < 7:
-                return self._default(spot_price, vix_current)
-
-            # -----------------------------
-            # REALIZED VOL
-            # -----------------------------
-            rv7 = self._realized_vol(returns, 7)
-            rv28 = self._realized_vol(returns, 28)
-
-            # -----------------------------
-            # PARKINSON VOL (DAILY ONLY)
-            # -----------------------------
-            pk7, pk28 = self._parkinson_vol(history_candles)
-
-            # -----------------------------
-            # VIX HISTORY (MANDATORY)
-            # -----------------------------
-            ivp30 = ivp90 = ivp1y = 50.0
-            vov = 0.0
-
-            if vix_history is not None and not vix_history.empty:
-                vix_closes = vix_history["close"].replace(
-                    [0, np.inf, -np.inf], np.nan
-                ).dropna()
-
-                if len(vix_closes) >= 30:
-                    ivp30 = self._percentile(vix_closes.tail(30), vix_current)
-                if len(vix_closes) >= 90:
-                    ivp90 = self._percentile(vix_closes.tail(90), vix_current)
-                if len(vix_closes) >= 252:
-                    ivp1y = self._percentile(vix_closes.tail(252), vix_current)
-
-                vov = self._vov(vix_closes)
-
-            # -----------------------------
-            # GARCH (CACHED)
-            # -----------------------------
-            if time.time() - self._last_garch_time > self.garch_interval:
-                g7, g28 = await asyncio.to_thread(self._run_garch, returns)
-                self._cached_garch7 = g7
-                self._cached_garch28 = g28
-                self._last_garch_time = time.time()
-            else:
-                g7 = self._cached_garch7
-                g28 = self._cached_garch28
-
-            if not math.isfinite(g7):
-                g7 = rv7
-            if not math.isfinite(g28):
-                g28 = rv28
-
-            # -----------------------------
-            # REGIME
-            # -----------------------------
-            regime = "NORMAL"
-            if ivp1y < 20:
-                regime = "LOW_VOL"
-            elif ivp1y > 80:
-                regime = "HIGH_VOL"
-
-            return VolMetrics(
-                spot=float(spot_price),
-                iv=float(vix_current),
-                vov=float(vov),
-                regime=regime,
-                ivp30=float(ivp30),
-                ivp90=float(ivp90),
-                ivp1y=float(ivp1y),
-                rv7=float(rv7),
-                rv28=float(rv28),
-                garch7=float(g7),
-                garch28=float(g28),
-                pk7=float(pk7),
-                pk28=float(pk28),
-                is_fallback=is_fallback,
+            # Offload the heavy math to a separate thread
+            return await asyncio.to_thread(
+                self._compute_sync, 
+                nifty_hist, 
+                vix_hist, 
+                spot_live, 
+                vix_live
             )
-
         except Exception as e:
-            logger.error("Volatility calculation failed", exc_info=True)
-            return self._default(spot_price, vix_current)
+            logger.error(f"Volatility Analysis Failed: {str(e)}")
+            # Return a "Safety" Fallback object if math fails
+            return self._get_fallback_metrics(spot_live, vix_live)
 
-    # -------------------------------------------------------------------------
-    # HELPERS
-    # -------------------------------------------------------------------------
-    def _realized_vol(self, returns, window):
-        if len(returns) < window:
-            return 0.0
-        return float(returns.tail(window).std() * np.sqrt(252) * 100)
+    def _compute_sync(self, df_spot: pd.DataFrame, df_vix: pd.DataFrame, spot_now: float, vix_now: float) -> VolMetrics:
+        """
+        Synchronous core logic - identical to v30.1 script but structured for production.
+        """
+        # 1. Data Prep & Fallback Handling
+        is_fallback = False
+        if spot_now <= 0 or vix_now <= 0:
+            spot_now = df_spot.iloc[-1]['close']
+            vix_now = df_vix.iloc[-1]['close']
+            is_fallback = True
 
-    def _parkinson_vol(self, df):
-        try:
-            h = df["high"].replace([0, np.inf], np.nan).dropna()
-            l = df["low"].replace([0, np.inf], np.nan).dropna()
-            idx = h.index.intersection(l.index)
+        # Log Returns
+        df_spot['returns'] = np.log(df_spot['close'] / df_spot['close'].shift(1))
+        returns = df_spot['returns'].dropna()
+        
+        # 2. Realized Volatility (RV) - 7, 28, 90 Days
+        # Annualized: std * sqrt(252) * 100
+        rv7 = returns.rolling(7).std().iloc[-1] * np.sqrt(252) * 100
+        rv28 = returns.rolling(28).std().iloc[-1] * np.sqrt(252) * 100
+        rv90 = returns.rolling(90).std().iloc[-1] * np.sqrt(252) * 100
 
-            if len(idx) < 7:
-                return 0.0, 0.0
+        # 3. Parkinson Volatility (Intraday Range) - Crucial for "Weighted VRP"
+        # Formula: 1/(4ln2) * ln(H/L)^2
+        const = 1.0 / (4.0 * np.log(2.0))
+        high_low_log = np.log(df_spot['high'] / df_spot['low']) ** 2
+        
+        park7 = np.sqrt(high_low_log.tail(7).mean() * const) * np.sqrt(252) * 100
+        park28 = np.sqrt(high_low_log.tail(28).mean() * const) * np.sqrt(252) * 100
 
-            rs = np.log(h.loc[idx] / l.loc[idx]) ** 2
-            const = 1.0 / (4.0 * np.log(2.0))
+        # 4. GARCH(1,1) Forecasting
+        # We catch errors here because arch_model can be finicky with small data
+        garch7 = self._fit_garch(returns, horizon=7) or rv7
+        garch28 = self._fit_garch(returns, horizon=28) or rv28
 
-            pk7 = np.sqrt(const * rs.tail(7).mean()) * np.sqrt(252) * 100
-            pk28 = np.sqrt(const * rs.tail(28).mean()) * np.sqrt(252) * 100
+        # 5. The "Holy Grail": Vol-of-Vol (VoV) Z-Score
+        # Logic: 30D Rolling Std of VIX Returns, Normalized by 60D History
+        vix_ret = np.log(df_vix['close'] / df_vix['close'].shift(1)).dropna()
+        vov_rolling = vix_ret.rolling(30).std() * np.sqrt(252) * 100
+        
+        vov_current = vov_rolling.iloc[-1]
+        vov_mean = vov_rolling.rolling(60).mean().iloc[-1]
+        vov_std = vov_rolling.rolling(60).std().iloc[-1]
+        
+        # Avoid division by zero
+        if vov_std > 0:
+            vov_zscore = (vov_current - vov_mean) / vov_std
+        else:
+            vov_zscore = 0.0
 
-            return pk7, pk28
-        except Exception:
-            return 0.0, 0.0
+        # 6. IV Percentile (Context)
+        ivp_30 = self._calc_ivp(df_vix['close'], vix_now, 30)
+        ivp_90 = self._calc_ivp(df_vix['close'], vix_now, 90)
+        ivp_1yr = self._calc_ivp(df_vix['close'], vix_now, 252)
 
-    def _run_garch(self, returns):
-        clean = returns.replace([np.inf, -np.inf], np.nan).dropna()
-        if len(clean) < 50 or clean.std() == 0:
-            return np.nan, np.nan
+        # 7. Trend Strength (ATR Based)
+        # Using ATR14 to determine if we are trending or ranging
+        high_low = df_spot['high'] - df_spot['low']
+        high_close = (df_spot['high'] - df_spot['close'].shift(1)).abs()
+        low_close = (df_spot['low'] - df_spot['close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean().iloc[-1]
+        ma20 = df_spot['close'].rolling(20).mean().iloc[-1]
+        trend_strength = abs(spot_now - ma20) / atr14 if atr14 > 0 else 0
 
-        model = arch_model(clean * 100, vol="Garch", p=1, q=1)
-        res = model.fit(disp="off")
-        var = res.forecast(horizon=28, reindex=False).variance.iloc[-1]
+        # 8. Preliminary Regime Tag (Detailed scoring happens in RegimeEngine)
+        regime_tag = "FAIR"
+        if vov_zscore > 2.5: 
+            regime_tag = "EXPLODING"  # Kill Switch
+        elif ivp_1yr > 75:
+            regime_tag = "RICH"
+        elif ivp_1yr < 25:
+            regime_tag = "CHEAP"
 
-        g7 = np.sqrt(var.iloc[:7].mean()) * np.sqrt(252)
-        g28 = np.sqrt(var.iloc[:28].mean()) * np.sqrt(252)
-        return float(g7), float(g28)
-
-    def _percentile(self, series, value):
-        return float((series < value).mean() * 100)
-
-    def _vov(self, vix_series):
-        rets = np.log(vix_series / vix_series.shift(1)).dropna()
-        if len(rets) < 20:
-            return 0.0
-        return float(rets.tail(20).std() * np.sqrt(252) * 100)
-
-    def _default(self, spot, vix):
         return VolMetrics(
-            spot=float(spot),
-            iv=float(vix),
-            vov=0.0,
-            regime="NORMAL",
-            ivp30=50.0,
-            ivp90=50.0,
-            ivp1y=50.0,
-            rv7=0.0,
-            rv28=0.0,
-            garch7=0.0,
-            garch28=0.0,
-            pk7=0.0,
-            pk28=0.0,
-            is_fallback=True,
+            spot=spot_now,
+            vix=vix_now,
+            rv7=rv7, rv28=rv28, rv90=rv90,
+            garch7=garch7, garch28=garch28,
+            park7=park7, park28=park28,
+            vov=vov_current,
+            vov_zscore=vov_zscore,
+            ivp_30d=ivp_30, ivp_90d=ivp_90, ivp_1yr=ivp_1yr,
+            trend_strength=trend_strength,
+            vol_regime=regime_tag,
+            is_fallback=is_fallback
+        )
+
+    def _fit_garch(self, returns: pd.Series, horizon: int) -> float:
+        """Helper to fit GARCH(1,1). Returns annualized vol forecast."""
+        try:
+            # Rescale for optimizer stability
+            scaled_returns = returns * 100
+            model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='normal')
+            res = model.fit(disp='off', show_warning=False)
+            forecast = res.forecast(horizon=horizon, reindex=False)
+            # Extract variance, sqrt to get vol, sqrt(252) to annualize
+            return np.sqrt(forecast.variance.values[-1, -1]) * np.sqrt(252)
+        except:
+            return 0.0
+
+    def _calc_ivp(self, history: pd.Series, current: float, window: int) -> float:
+        """Calculate IV Percentile over a lookback window."""
+        if len(history) < window: 
+            return 0.0
+        relevant_hist = history.tail(window)
+        return (relevant_hist < current).mean() * 100
+
+    def _get_fallback_metrics(self, spot: float, vix: float) -> VolMetrics:
+        """Returns safe default values if analysis crashes."""
+        return VolMetrics(
+            spot=spot, vix=vix,
+            rv7=0, rv28=0, rv90=0,
+            garch7=0, garch28=0,
+            park7=0, park28=0,
+            vov=0, vov_zscore=0,
+            ivp_30d=0, ivp_90d=0, ivp_1yr=0,
+            trend_strength=0,
+            vol_regime="ERROR",
+            is_fallback=True
         )
