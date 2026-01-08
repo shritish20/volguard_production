@@ -30,6 +30,9 @@ class VolMetrics:
     ivp_90d: float
     ivp_1yr: float
     trend_strength: float
+    # CRITICAL ADDITIONS FOR TRADING ENGINE
+    atr14: float          # <--- Used for strike width
+    ma20: float           # <--- Used for trend bias
     vol_regime: str
     is_fallback: bool
 
@@ -71,8 +74,8 @@ class VolatilityEngine:
         # 1. Data Prep & Fallback Handling
         is_fallback = False
         if spot_now <= 0 or vix_now <= 0:
-            spot_now = df_spot.iloc[-1]['close']
-            vix_now = df_vix.iloc[-1]['close']
+            spot_now = df_spot.iloc[-1]['close'] if not df_spot.empty else 0
+            vix_now = df_vix.iloc[-1]['close'] if not df_vix.empty else 0
             is_fallback = True
 
         # Log Returns
@@ -103,9 +106,9 @@ class VolatilityEngine:
         vix_ret = np.log(df_vix['close'] / df_vix['close'].shift(1)).dropna()
         vov_rolling = vix_ret.rolling(30).std() * np.sqrt(252) * 100
         
-        vov_current = vov_rolling.iloc[-1]
-        vov_mean = vov_rolling.rolling(60).mean().iloc[-1]
-        vov_std = vov_rolling.rolling(60).std().iloc[-1]
+        vov_current = vov_rolling.iloc[-1] if not vov_rolling.empty else 0
+        vov_mean = vov_rolling.rolling(60).mean().iloc[-1] if not vov_rolling.empty else 0
+        vov_std = vov_rolling.rolling(60).std().iloc[-1] if not vov_rolling.empty else 1
         
         # Avoid division by zero
         if vov_std > 0:
@@ -124,8 +127,10 @@ class VolatilityEngine:
         high_close = (df_spot['high'] - df_spot['close'].shift(1)).abs()
         low_close = (df_spot['low'] - df_spot['close'].shift(1)).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr14 = tr.rolling(14).mean().iloc[-1]
-        ma20 = df_spot['close'].rolling(20).mean().iloc[-1]
+        
+        atr14 = tr.rolling(14).mean().iloc[-1] if not tr.empty else 0
+        ma20 = df_spot['close'].rolling(20).mean().iloc[-1] if not df_spot.empty else 0
+        
         trend_strength = abs(spot_now - ma20) / atr14 if atr14 > 0 else 0
 
         # 8. Preliminary Regime Tag (Detailed scoring happens in RegimeEngine)
@@ -147,6 +152,8 @@ class VolatilityEngine:
             vov_zscore=vov_zscore,
             ivp_30d=ivp_30, ivp_90d=ivp_90, ivp_1yr=ivp_1yr,
             trend_strength=trend_strength,
+            atr14=atr14,  # <--- CRITICAL: Passed to object
+            ma20=ma20,    # <--- CRITICAL: Passed to object
             vol_regime=regime_tag,
             is_fallback=is_fallback
         )
@@ -181,6 +188,7 @@ class VolatilityEngine:
             vov=0, vov_zscore=0,
             ivp_30d=0, ivp_90d=0, ivp_1yr=0,
             trend_strength=0,
+            atr14=0, ma20=0, # <--- Added to fallback
             vol_regime="ERROR",
             is_fallback=True
         )
