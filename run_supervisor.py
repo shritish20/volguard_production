@@ -1,4 +1,3 @@
-# run_supervisor.py
 import asyncio
 import logging
 import signal
@@ -19,6 +18,9 @@ from app.core.trading.executor import TradeExecutor
 from app.core.trading.engine import TradingEngine
 from app.core.trading.adjustment_engine import AdjustmentEngine
 
+# NEW: VolGuard 4.1 Dependency
+from app.services.instrument_registry import registry
+
 # Initialize Structured Logging
 logger = setup_logging()
 
@@ -38,7 +40,7 @@ async def shutdown(signal_name, loop, supervisor, resources):
     logger.info(f"Cancelling {len(tasks)} outstanding tasks")
     await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Close Resources (Handle various close method names)
+    # Close Resources
     logger.info("Closing Resources...")
     for name, res in resources.items():
         if res:
@@ -60,52 +62,53 @@ async def shutdown(signal_name, loop, supervisor, resources):
     loop.stop()
 
 async def main():
-    logger.info(f"🚀 Starting VolGuard Supervisor [Env: {settings.ENVIRONMENT}]")
+    logger.info(f"🚀 Starting VolGuard 4.1 Supervisor [Env: {settings.ENVIRONMENT}]")
 
     # 1. Database Initialization
     logger.info("Connecting to Database...")
     await init_db()
 
-    # 2. Initialize Market Data Client
+    # 2. VolGuard 4.1 Prerequisite: Load Instrument Registry
+    # We do this BEFORE initializing engines so Lot Sizes are available immediately.
+    logger.info("📦 Pre-loading Instrument Master (VolGuard 4.1)...")
+    try:
+        # Run in thread to avoid blocking loop if download is slow
+        await asyncio.to_thread(registry.load_master)
+    except Exception as e:
+        logger.error(f"⚠️ Registry pre-load failed: {e}. Supervisor will retry in loop.")
+
+    # 3. Initialize Market Data Client
     market_client = MarketDataClient(
         settings.UPSTOX_ACCESS_TOKEN,
         settings.UPSTOX_BASE_V2,
         settings.UPSTOX_BASE_V3
     )
     
-    # 3. Initialize Trade Executor (Redis connection handled internally)
+    # 4. Initialize Trade Executor
     trade_executor = TradeExecutor(settings.UPSTOX_ACCESS_TOKEN)
     
-    # 4. Initialize WebSocket Service with CRITICAL FIX
+    # 5. Initialize WebSocket Service
     websocket_service = None
     if settings.SUPERVISOR_WEBSOCKET_ENABLED:
         logger.info("🔌 Initializing WebSocket Service...")
         
-        # ✅ CRITICAL FIX: Subscribe to NIFTY + VIX for live market data
         websocket_service = MarketDataFeed(
             access_token=settings.UPSTOX_ACCESS_TOKEN,
-            instrument_keys=[NIFTY_KEY, VIX_KEY],  # ✅ Core market data subscription
-            mode="full",  # Get complete data including Greeks
-            auto_reconnect_enabled=True,  # Enable SDK auto-reconnect
-            reconnect_interval=10,  # Retry every 10 seconds
-            max_retries=5  # Max 5 reconnection attempts
+            instrument_keys=[NIFTY_KEY, VIX_KEY],  # Core subscriptions
+            mode="full",
+            auto_reconnect_enabled=True,
+            reconnect_interval=10,
+            max_retries=5
         )
-        
-        logger.info(f"✅ WebSocket configured with subscriptions:")
-        logger.info(f"   • {NIFTY_KEY}")
-        logger.info(f"   • {VIX_KEY}")
-        logger.info(f"   • Mode: full (includes Greeks)")
-        logger.info(f"   • Auto-reconnect: Enabled (10s interval, 5 retries)")
+        logger.info(f"✅ WebSocket configured for {NIFTY_KEY} & {VIX_KEY}")
     else:
         logger.warning("⚠️ WebSocket DISABLED - Using REST API fallback only")
 
-    # 5. Initialize Risk & Trading Engines
-    logger.info("⚙️ Initializing Trading Engines...")
+    # 6. Initialize Risk & Trading Engines
+    logger.info("⚙️ Initializing VolGuard Engines...")
     
-    # Risk Engine (expects float for max_portfolio_loss)
     risk_engine = RiskEngine(max_portfolio_loss=settings.MAX_DAILY_LOSS)
     
-    # Capital Governor
     cap_governor = CapitalGovernor(
         access_token=settings.UPSTOX_ACCESS_TOKEN,
         total_capital=settings.BASE_CAPITAL,
@@ -113,13 +116,12 @@ async def main():
         max_positions=settings.MAX_POSITIONS
     )
     
-    # Trading Engine (gets full config for strategy parameters)
+    # This engine now uses the new Mandate logic
     trading_engine = TradingEngine(market_client, settings.model_dump())
     
-    # Adjustment Engine (delta hedging threshold)
     adj_engine = AdjustmentEngine(delta_threshold=15.0)
 
-    # 6. Initialize Supervisor
+    # 7. Initialize Supervisor
     logger.info("🧠 Booting Production Supervisor...")
     supervisor = ProductionTradingSupervisor(
         market_client=market_client,
@@ -128,28 +130,27 @@ async def main():
         trade_executor=trade_executor,
         trading_engine=trading_engine,
         capital_governor=cap_governor,
-        websocket_service=websocket_service,  # ✅ WebSocket now properly configured
+        websocket_service=websocket_service,
         loop_interval_seconds=settings.SUPERVISOR_LOOP_INTERVAL
     )
 
-    # 7. Set Execution Mode based on Environment
+    # 8. Set Execution Mode
     if settings.ENVIRONMENT == "production_live":
         logger.warning("🚨 !!! RUNNING IN FULL_AUTO MODE - REAL TRADING ENABLED !!! 🚨")
-        logger.warning("🚨 !!! ALL TRADES WILL BE EXECUTED AUTOMATICALLY !!! 🚨")
         supervisor.safety.execution_mode = ExecutionMode.FULL_AUTO
     elif settings.ENVIRONMENT == "production_semi":
         logger.info("⚠️ Running in SEMI_AUTO Mode - Manual Approvals Required")
         supervisor.safety.execution_mode = ExecutionMode.SEMI_AUTO
     else:
-        logger.info("✅ Running in SHADOW Mode - Monitoring Only (Safe)")
+        logger.info("✅ Running in SHADOW Mode - Monitoring Only")
         supervisor.safety.execution_mode = ExecutionMode.SHADOW
 
-    # 8. Setup Signal Handlers for Graceful Shutdown
+    # 9. Setup Signal Handlers
     loop = asyncio.get_running_loop()
     resources = {
         "MarketClient": market_client,
         "WebsocketService": websocket_service,
-        "TradeExecutor": trade_executor  # Now included for proper cleanup
+        "TradeExecutor": trade_executor
     }
     
     for signame in {'SIGINT', 'SIGTERM'}:
@@ -158,12 +159,10 @@ async def main():
             lambda s=signame: asyncio.create_task(shutdown(s, loop, supervisor, resources))
         )
 
-    # 9. Start Supervisor Loop
+    # 10. Start Supervisor Loop
     logger.info("🎯 Starting Supervisor Loop...")
     logger.info(f"📊 Loop Interval: {settings.SUPERVISOR_LOOP_INTERVAL}s")
     logger.info(f"💰 Base Capital: ₹{settings.BASE_CAPITAL:,.0f}")
-    logger.info(f"🛑 Max Daily Loss: ₹{settings.MAX_DAILY_LOSS:,.0f}")
-    logger.info(f"📈 Max Positions: {settings.MAX_POSITIONS}")
     logger.info("=" * 60)
     
     try:
@@ -172,12 +171,14 @@ async def main():
         logger.info("Main task cancelled")
     except Exception as e:
         logger.critical(f"💥 Supervisor crashed: {e}", exc_info=True)
-        # Attempt emergency cleanup
         await shutdown(signal.SIGTERM, loop, supervisor, resources)
 
 if __name__ == "__main__":
+    # Ensure event loop policy is correct for Windows (if developing there)
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-        pass  # Handled by signal handler
+        pass
