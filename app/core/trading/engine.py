@@ -1,189 +1,228 @@
-# app/core/trading/engine.py
-
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, date
+import pandas as pd
+import numpy as np
 
 from app.config import settings
-from app.core.trading.leg_builder import LegBuilder
-from app.core.trading.strategy_selector import StrategySelector
+from app.services.instrument_registry import registry
+from app.core.trading.leg_builder import LegBuilder # Kept for utility, but logic moved here
+from app.schemas.analytics import VolMetrics
 
-# EV & Capital Integration
-from app.core.ev import TrueEVEngine, RawEdgeInputs, CapitalBucketEngine
-from app.schemas.analytics import RegimeResult, VolMetrics
+# For typing, we use a forward reference or Any if Mandate isn't in schemas yet
+from typing import Any 
 
 logger = logging.getLogger(__name__)
 
-
 class TradingEngine:
     """
-    VolGuard Execution Engine (v3.1 + EV Core)
-    Decision Flow: Regime -> Strategy -> EV Check -> Capital Bucket -> Legs
+    VolGuard 4.1 Execution Engine.
+    The "Hands" of the system. Executes the Mandate provided by the Brain (RegimeEngine).
     """
 
     def __init__(self, market_client, config: Dict):
         self.client = market_client
         self.config = config
-
-        self.selector = StrategySelector()
-        self.builder = LegBuilder()
-
-        self.ev_engine = TrueEVEngine()
-        self.bucket_engine = CapitalBucketEngine(
-            total_capital=settings.BASE_CAPITAL
-        )
+        self.builder = LegBuilder() 
 
     async def generate_entry_orders(
         self,
-        regime: RegimeResult,
+        mandate: Any, # TradingMandate object
         vol: VolMetrics,
         snapshot: Dict
     ) -> List[Dict]:
-
-        # 1. REGIME PERMISSION
-        self.bucket_engine.enforce_regime(regime.name)
-
-        logger.debug(
-            f"Bucket status: "
-            f"{ {k: b.active for k, b in self.bucket_engine.buckets.items()} }"
-        )
-
-        if regime.name == "CASH" or regime.alloc_pct <= 0:
-            return []
-
-        # 2. STRATEGY SELECTION
-        strategy_def = self.selector.select_strategy(regime, vol)
-        if not strategy_def:
-            logger.info(f"No strategy candidate for regime {regime.name}")
-            return []
-
-        # 3. EV VALIDATION
-        current_iv = snapshot.get("vix", 0.0)
-
-        ev_inputs = RawEdgeInputs(
-            atm_iv=current_iv,
-            rv=vol.rv7,
-            garch=vol.garch7,
-            parkinson=vol.pk7,
-            ivp=vol.ivp1y,
-            fast_vol=snapshot.get("fast_vol", False)
-        )
-
-        ev_results = self.ev_engine.evaluate(
-            raw=ev_inputs,
-            regime=regime.name,
-            expected_theta={strategy_def.name: 1000.0}
-        )
-
-        if not ev_results:
-            logger.info(f"⛔ EV blocked trade for {strategy_def.name}")
-            return []
-
-        if not any(ev.strategy == strategy_def.name for ev in ev_results):
-            logger.info(f"⛔ Strategy {strategy_def.name} rejected by EV ranking")
-            return []
-
-        best_ev = ev_results[0]
-        logger.info(f"✅ EV Passed | EV={best_ev.final_ev:.4f}")
-
-        # 4. EXPIRY SELECTION (LIVE)
-        chain = await self._get_best_expiry_chain(snapshot.get("symbol", "NIFTY"))
-        if chain is None or chain.empty:
-            logger.warning("No valid option chain found")
-            return []
-
-        # 5. CAPITAL SIZING
-        bucket_name = self._get_strategy_bucket(strategy_def.name)
-        lots = self._calculate_bucket_lots(bucket_name, regime)
-
-        if lots <= 0:
-            logger.info(f"Insufficient capital in bucket '{bucket_name}'")
-            return []
-
-        # 6. LEG CONSTRUCTION
-        legs = await self.builder.build_legs(
-            strategy=strategy_def,
-            chain=chain,
-            lots=lots,
-            market_client=self.client
-        )
-
-        if legs:
-            logger.info(
-                f"🚀 Generated {len(legs)} legs | "
-                f"Strategy={strategy_def.name} | Lots={lots}"
-            )
-
-        return legs or []
-
-    # =============================================================
-
-    def _get_strategy_bucket(self, strategy_name: str) -> str:
-        name = strategy_name.upper()
-        if "INTRADAY" in name or "SCALP" in name:
-            return "INTRADAY"
-        if "IRON_CONDOR" in name or "FLY" in name:
-            return "WEEKLY"
-        if "POSITIONAL" in name or "CALENDAR" in name:
-            return "MONTHLY"
-        return "WEEKLY"
-
-    def _calculate_bucket_lots(self, bucket_name: str, regime: RegimeResult) -> int:
+        """
+        Converts a strategic TradingMandate into specific Order objects.
+        """
         try:
-            bucket_capital = self.bucket_engine.get_bucket_capital(bucket_name)
-            if bucket_capital <= 0:
-                return 0
+            # 1. Validation
+            if mandate.regime_name == "CASH" or mandate.allocation_pct <= 0:
+                return []
 
-            # Global cap from Regime
-            global_cap_limit = settings.BASE_CAPITAL * regime.alloc_pct
+            if mandate.max_lots <= 0:
+                logger.warning(f"Mandate allows trade but Max Lots is 0. Check Capital.")
+                return []
+
+            # 2. Select Expiry (Weekly vs Monthly)
+            expiry_date = await self._resolve_expiry(mandate.expiry_type)
+            if not expiry_date:
+                logger.error(f"Could not resolve expiry for {mandate.expiry_type}")
+                return []
+
+            # 3. Fetch Option Chain
+            chain = await self.client.get_option_chain(expiry_date.strftime("%Y-%m-%d"))
+            if chain is None or chain.empty:
+                logger.error(f"Option chain empty for {expiry_date}")
+                return []
+
+            logger.info(f"🏗️ Building {mandate.strategy_type} ({mandate.expiry_type}) | Lots: {mandate.max_lots}")
+
+            # 4. Route to Strategy Builder
+            if mandate.strategy_type == "STRANGLE":
+                return self._build_strangle(chain, vol, snapshot, mandate)
             
-            # Use strict minimum of bucket vs global
-            usable_capital = min(bucket_capital, global_cap_limit)
-
-            # Conservative margin estimate (approx 1.5L for selling)
-            margin_per_lot = 150_000.0
+            elif mandate.strategy_type == "IRON_CONDOR":
+                return self._build_iron_condor(chain, vol, snapshot, mandate)
             
-            raw_lots = int(usable_capital / margin_per_lot)
-
-            # FIX: Removed settings.REGIME_MAX_LOTS dependency to prevent
-            # default=0 from blocking all trades.
-            # We rely on regime.max_lots which is calculated dynamically.
-            return max(
-                0,
-                min(raw_lots, regime.max_lots)
-            )
+            elif mandate.strategy_type == "IRON_FLY":
+                return self._build_iron_fly(chain, vol, snapshot, mandate)
+            
+            elif mandate.strategy_type == "CREDIT_SPREAD":
+                return self._build_credit_spread(chain, vol, snapshot, mandate)
+            
+            else:
+                logger.warning(f"Unknown strategy type: {mandate.strategy_type}")
+                return []
 
         except Exception as e:
-            logger.error(f"Lot sizing error: {e}")
-            return 0
+            logger.error(f"Order Generation Failed: {e}", exc_info=True)
+            return []
 
-    async def _get_best_expiry_chain(self, symbol: str) -> Optional[object]:
+    # =================================================================
+    # STRATEGY BUILDERS
+    # =================================================================
+
+    def _build_strangle(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
+        """
+        Aggressive Short: Sell OTM Call + Sell OTM Put.
+        Target: ~15 Delta or 1 StdDev OTM.
+        """
+        spot = snapshot['spot']
+        
+        # Dynamic Width based on Volatility (ATR)
+        # Higher Vol = Wider Strangle
+        width_mult = 1.0 if vol.ivp_1yr < 50 else 1.2
+        range_pts = (vol.atr14 * 2.0) * width_mult
+        
+        upper_target = spot + range_pts
+        lower_target = spot - range_pts
+
+        ce_leg = self._find_strike(chain, "CE", upper_target, "SHORT", mandate.max_lots)
+        pe_leg = self._find_strike(chain, "PE", lower_target, "SHORT", mandate.max_lots)
+
+        return [x for x in [ce_leg, pe_leg] if x]
+
+    def _build_iron_condor(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
+        """
+        Moderate Short: Sell OTM Strangle + Buy Wings for protection.
+        """
+        spot = snapshot['spot']
+        range_pts = vol.atr14 * 1.5 # Tighter than strangle
+        wing_width = 200 # Fixed width or ATR based
+        
+        # Short Strikes
+        short_ce_target = spot + range_pts
+        short_pe_target = spot - range_pts
+        
+        # Long Strikes (Wings)
+        long_ce_target = short_ce_target + wing_width
+        long_pe_target = short_pe_target - wing_width
+
+        orders = []
+        orders.append(self._find_strike(chain, "CE", short_ce_target, "SHORT", mandate.max_lots))
+        orders.append(self._find_strike(chain, "PE", short_pe_target, "SHORT", mandate.max_lots))
+        orders.append(self._find_strike(chain, "CE", long_ce_target, "LONG", mandate.max_lots)) # Hedge
+        orders.append(self._find_strike(chain, "PE", long_pe_target, "LONG", mandate.max_lots)) # Hedge
+        
+        return [x for x in orders if x]
+
+    def _build_iron_fly(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
+        """
+        Theta Play: Sell ATM Straddle + Buy Wings.
+        Used when DTE is low (Weekly).
+        """
+        spot = snapshot['spot']
+        # Wing width proportional to expected move
+        wing_width = vol.atr14 * 1.0 
+
+        orders = []
+        # Sell ATM
+        orders.append(self._find_strike(chain, "CE", spot, "SHORT", mandate.max_lots))
+        orders.append(self._find_strike(chain, "PE", spot, "SHORT", mandate.max_lots))
+        # Buy Wings
+        orders.append(self._find_strike(chain, "CE", spot + wing_width, "LONG", mandate.max_lots))
+        orders.append(self._find_strike(chain, "PE", spot - wing_width, "LONG", mandate.max_lots))
+
+        return [x for x in orders if x]
+
+    def _build_credit_spread(self, chain: pd.DataFrame, vol: VolMetrics, snapshot: Dict, mandate: Any) -> List[Dict]:
+        """
+        Defensive: Directional Credit Spread based on Trend.
+        """
+        spot = snapshot['spot']
+        ma20 = vol.trend_strength * vol.atr14 # Heuristic to recover MA20 proxy logic if needed
+        # Or simpler: check mandate warnings/rationale for direction? 
+        # For now, we default to Bull Put Spread (neutral/bullish bias) 
+        # unless market is crashing.
+        
+        is_bearish = vol.vov_zscore > 1.0 # Simple filter
+        
+        orders = []
+        if is_bearish:
+            # Bear Call Spread
+            short = spot + (vol.atr14 * 0.5)
+            long_strike = short + 100
+            orders.append(self._find_strike(chain, "CE", short, "SHORT", mandate.max_lots))
+            orders.append(self._find_strike(chain, "CE", long_strike, "LONG", mandate.max_lots))
+        else:
+            # Bull Put Spread
+            short = spot - (vol.atr14 * 0.5)
+            long_strike = short - 100
+            orders.append(self._find_strike(chain, "PE", short, "SHORT", mandate.max_lots))
+            orders.append(self._find_strike(chain, "PE", long_strike, "LONG", mandate.max_lots))
+            
+        return [x for x in orders if x]
+
+    # =================================================================
+    # UTILITIES
+    # =================================================================
+
+    def _find_strike(self, chain: pd.DataFrame, opt_type: str, price_target: float, side: str, lots: int) -> Optional[Dict]:
+        """
+        Finds the specific contract in the chain closest to the target price.
+        """
         try:
-            weekly, monthly = await self.client.get_expiries()
-            if not weekly:
-                return None
+            # Filter by type
+            subset = chain[chain['instrument_name'].str.endswith(opt_type)].copy()
+            if subset.empty: return None
 
-            today = date.today()
-            candidates = []
+            # Find closest strike
+            subset['diff'] = abs(subset['strike'] - price_target)
+            best_row = subset.nsmallest(1, 'diff').iloc[0]
 
-            for exp_str in [weekly, monthly]:
-                if not exp_str:
-                    continue
-                try:
-                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-                    dte = (exp_date - today).days
-                    if 2 <= dte <= 45:
-                        candidates.append((dte, exp_str))
-                except ValueError:
-                    continue
-
-            if not candidates:
-                return None
-
-            candidates.sort(key=lambda x: x[0])
-            # Fetch LIVE chain data
-            return await self.client.get_option_chain(candidates[0][1])
-
+            # Build Order Dict (compatible with TradeExecutor)
+            return {
+                "instrument_key": best_row['instrument_key'],
+                "symbol": best_row['trading_symbol'],
+                "strike": float(best_row['strike']),
+                "option_type": opt_type,
+                "expiry_date": best_row['expiry'],
+                "side": "SELL" if side == "SHORT" else "BUY",
+                "quantity": lots * 50, # Lot size hardcoded or fetch from registry if available
+                "order_type": "MARKET",
+                "product": "I", # Intraday/Margin
+                "strategy": "ALGO_ENTRY",
+                "tag": "VolGuard_4.1"
+            }
         except Exception as e:
-            logger.error(f"Expiry fetch failed: {e}")
+            logger.error(f"Strike selection error: {e}")
             return None
+
+    async def _resolve_expiry(self, expiry_type: str) -> Optional[date]:
+        """Gets authoritative expiry from Registry."""
+        weekly, monthly = registry.get_nifty_expiries()
+        
+        if expiry_type == "WEEKLY":
+            return weekly
+        elif expiry_type == "MONTHLY":
+            return monthly
+        
+        # Fallback
+        return weekly
+
+    # Legacy method for compatibility if Supervisor calls it directly
+    async def _get_best_expiry_chain(self, symbol="NIFTY") -> Tuple[Optional[date], Optional[pd.DataFrame]]:
+        weekly, _ = registry.get_nifty_expiries()
+        if not weekly: return None, None
+        chain = await self.client.get_option_chain(weekly.strftime("%Y-%m-%d"))
+        return weekly, chain
