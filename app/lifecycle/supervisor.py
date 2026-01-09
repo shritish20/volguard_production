@@ -18,13 +18,13 @@ from app.lifecycle.safety_controller import SafetyController, ExecutionMode, Sys
 from app.core.risk.capital_governor import CapitalGovernor
 from app.services.approval_system import ManualApprovalSystem
 
-# Core Engines (VolGuard 4.1)
+# Core Engines (VolGuard 5.0)
 from app.core.trading.exit_engine import ExitEngine
 from app.core.analytics.regime import RegimeEngine
 from app.core.analytics.structure import StructureEngine
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.edge import EdgeEngine
-from app.core.market.participant_client import ParticipantClient  # <--- NEW FII CLIENT
+from app.core.market.participant_client import ParticipantClient
 
 from app.core.trading.adjustment_engine import AdjustmentEngine
 from app.core.trading.executor import TradeExecutor
@@ -33,6 +33,9 @@ from app.core.risk.engine import RiskEngine
 from app.core.market.data_client import MarketDataClient, NIFTY_KEY, VIX_KEY
 from app.schemas.analytics import ExtMetrics, VolMetrics, RegimeResult
 from app.config import settings
+
+# NEW IMPORT for TokenManager
+from app.core.auth.token_manager import TokenManager
 
 # Metrics
 from app.utils.metrics import (
@@ -50,11 +53,13 @@ logger = logging.getLogger(__name__)
 
 class ProductionTradingSupervisor:
     """ 
-    VolGuard 4.1 Supervisor
+    VolGuard 5.0 Supervisor - WITH STARTUP GATE
     
-    MERGED ARCHITECTURE:
-    ✅ Brain: VolGuard 4.1 (FII Flow, Weighted VRP, VoV Kill Switch)
-    ✅ Body: VolGuard 3.0 (Smart Loop, Background Tasks, Safety Locks)
+    ENHANCEMENTS:
+    1. ✅ Startup Market-Open Check Gate
+    2. ✅ Token Manager Integration
+    3. ✅ Enhanced Safety Layer with Margin Audit
+    4. ✅ All VolGuard 5.0 Hybrid Logic (Straddle Range + Delta Wings)
     """
 
     def __init__(
@@ -65,6 +70,7 @@ class ProductionTradingSupervisor:
         trade_executor: TradeExecutor,
         trading_engine: TradingEngine,
         capital_governor: CapitalGovernor,
+        token_manager: TokenManager,  # NEW: Token manager for API calls
         websocket_service=None,
         loop_interval_seconds: float = 3.0,
     ):
@@ -75,6 +81,7 @@ class ProductionTradingSupervisor:
         self.exec = trade_executor
         self.engine = trading_engine
         self.cap_governor = capital_governor
+        self.token_manager = token_manager  # NEW
         self.ws = websocket_service
 
         # Safety & Governance
@@ -82,13 +89,13 @@ class ProductionTradingSupervisor:
         self.safety = SafetyController()
         self.approvals = ManualApprovalSystem()
 
-        # Analytics Brain (VolGuard 4.1 Upgrades)
+        # Analytics Brain (VolGuard 5.0 Upgrades)
         self.exit_engine = ExitEngine()
         self.regime_engine = RegimeEngine()
         self.structure_engine = StructureEngine()
         self.vol_engine = VolatilityEngine()
         self.edge_engine = EdgeEngine()
-        self.participant_client = ParticipantClient() # <--- NEW
+        self.participant_client = ParticipantClient()
 
         # Loop Control
         self.interval = loop_interval_seconds
@@ -122,15 +129,43 @@ class ProductionTradingSupervisor:
         self._intraday_refresh_lock = asyncio.Lock()
         self._position_update_lock = asyncio.Lock()
         self._capital_update_lock = asyncio.Lock()
+        
+        # Startup Flags
+        self.market_open_verified = False
+        self.token_validated = False
 
     async def start(self):
-        """Main Entry Point - The Boot Sequence"""
-        logger.info(f"🤖 VolGuard 4.1 Supervisor booting in {self.safety.execution_mode.value} mode")
+        """Main Entry Point - The Boot Sequence with Startup Gates"""
+        logger.info(f"🤖 VolGuard 5.0 Supervisor booting in {self.safety.execution_mode.value} mode")
 
-        # 1. MARKET STATUS CHECK
+        # ================================================
+        # 🚀 STARTUP GATES (CRITICAL SAFETY CHECKS)
+        # ================================================
+        
+        # GATE 1: Token Validation
+        if not await self._validate_startup_token():
+            logger.critical("❌ Token validation failed - Aborting startup")
+            await self.safety.trigger_full_stop("STARTUP_TOKEN_INVALID")
+            return
+            
+        # GATE 2: Market Open Check (NEW STARTUP GATE)
+        if not await self.await_market_open():
+            logger.critical("❌ Market not open - Aborting startup")
+            await self.safety.trigger_full_stop("STARTUP_MARKET_CLOSED")
+            return
+            
+        # GATE 3: Token Health Check
+        if not await self.token_manager.validate_token():
+            logger.critical("❌ Token health check failed - Aborting startup")
+            await self.safety.trigger_full_stop("STARTUP_TOKEN_UNHEALTHY")
+            return
+
+        # GATE 4: Market Status Check
         await self._check_market_status()
 
-        # 2. STRICT RECONCILIATION (CRITICAL)
+        # ================================================
+        # 🔧 STRICT RECONCILIATION (CRITICAL)
+        # ================================================
         logger.info("🔧 Reconciling Broker State with Database...")
         try:
             await self.exec.reconcile_state()
@@ -150,12 +185,96 @@ class ProductionTradingSupervisor:
                 await self.safety.record_failure("RECONCILIATION_FAILED", 
                     {"error": str(e), "mode": "SHADOW"}, "HIGH")
 
+        # ================================================
+        # 🏁 START THE MAIN LOOP
+        # ================================================
         self.running = True
+        logger.info("✅ All startup gates passed. Starting main loop...")
         
         try:
             await self._run_smart_loop()
         finally:
             await self._cleanup_background_tasks()
+
+    async def await_market_open(self):
+        """
+        NEW STARTUP GATE: Wait for market to open before proceeding
+        
+        Returns:
+            True if market opens successfully, False on timeout/failure
+        """
+        logger.info("⏳ Startup: Checking Market Status...")
+        
+        max_wait_time = 300  # Maximum 5 minutes to wait
+        start_time = time.time()
+        
+        while True:
+            # Check if we've waited too long
+            elapsed = time.time() - start_time
+            if elapsed > max_wait_time:
+                logger.error(f"Market open check timeout after {elapsed:.0f}s")
+                return False
+            
+            try:
+                # Use token manager for authenticated API call
+                headers = self.token_manager.get_headers()
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://api.upstox.com/v2/market/status/NSE",
+                        headers=headers,
+                        timeout=10
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            market_status = data.get('data', {}).get('status', 'closed')
+                            
+                            if market_status == "open":
+                                logger.info("✅ Market OPEN. Proceeding with startup...")
+                                self.market_open_verified = True
+                                return True
+                            else:
+                                logger.info(f"Market status: {market_status}. Waiting...")
+                        else:
+                            logger.warning(f"Market status API error: {response.status}")
+                            
+            except asyncio.TimeoutError:
+                logger.warning("Market status check timeout")
+            except aiohttp.ClientError as e:
+                logger.warning(f"Market status check network error: {e}")
+            except Exception as e:
+                logger.error(f"Market status check unexpected error: {e}")
+            
+            # Wait before retrying
+            wait_time = min(10, max_wait_time - elapsed)  # Wait up to 10 seconds
+            if wait_time > 0:
+                logger.debug(f"Waiting {wait_time}s before next market status check...")
+                await asyncio.sleep(wait_time)
+        
+        return False
+
+    async def _validate_startup_token(self):
+        """
+        Validate token at startup
+        
+        Returns:
+            True if token is valid, False otherwise
+        """
+        logger.info("🔐 Validating access token...")
+        
+        try:
+            # Use token manager's validation
+            if await self.token_manager.validate_token():
+                self.token_validated = True
+                logger.info("✅ Token validated successfully")
+                return True
+            else:
+                logger.error("❌ Token validation failed")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return False
 
     async def _run_smart_loop(self):
         """
@@ -165,6 +284,9 @@ class ProductionTradingSupervisor:
         
         next_tick = time.monotonic()
         cycle_counter = 0
+        
+        # NEW: Perform initial margin audit
+        await self._perform_margin_audit()
         
         while self.running:
             cycle_counter += 1
@@ -228,6 +350,9 @@ class ProductionTradingSupervisor:
                     
                     self.last_heavy_refresh_date = today
                     logger.info("✅ Daily Data Ritual Complete")
+                    
+                    # NEW: Daily margin audit
+                    await self._perform_margin_audit()
 
                 # ========================================================
                 # 🚀 PHASE 3: ACTIVE TRADING CYCLE
@@ -247,6 +372,10 @@ class ProductionTradingSupervisor:
 
                 # Execute main trading logic
                 await self._execute_trading_cycle(cycle_counter)
+                
+                # NEW: Periodic margin audit (every 60 cycles ~ 3 minutes)
+                if cycle_counter % 60 == 0:
+                    await self._perform_margin_audit()
 
             except Exception as e:
                 logger.error(f"💥 Smart Loop Error: {e}", exc_info=True)
@@ -262,6 +391,61 @@ class ProductionTradingSupervisor:
             
             await asyncio.sleep(sleep_time)
             next_tick += self.interval
+
+    async def _perform_margin_audit(self):
+        """
+        NEW: Perform margin integrity audit
+        
+        Checks broker margin vs internal tracking
+        Triggers emergency stop if mismatch detected
+        """
+        try:
+            # Use capital governor's audit method if available
+            if hasattr(self.cap_governor, 'audit_margin_integrity'):
+                await self.cap_governor.audit_margin_integrity()
+            else:
+                # Fallback audit logic
+                await self._basic_margin_audit()
+                
+        except Exception as e:
+            logger.error(f"Margin audit failed: {e}")
+
+    async def _basic_margin_audit(self):
+        """
+        Basic margin audit comparing broker vs internal tracking
+        """
+        try:
+            # Get broker margin
+            broker_margin = await self.cap_governor.get_available_funds()
+            
+            # Get internal tracking (approximate)
+            internal_margin = self.cap_governor.local_tracker.get_available()
+            
+            # Calculate drift
+            if broker_margin > 0 and internal_margin > 0:
+                drift_pct = abs(broker_margin - internal_margin) / broker_margin * 100
+                
+                if drift_pct > 5.0:  # More than 5% drift
+                    logger.critical(f"💰 MARGIN DRIFT DETECTED: Broker={broker_margin:.0f}, "
+                                  f"Internal={internal_margin:.0f}, Drift={drift_pct:.1f}%")
+                    
+                    # Trigger safety check
+                    await self.safety.record_failure(
+                        "MARGIN_MISMATCH",
+                        {
+                            "broker_margin": broker_margin,
+                            "internal_margin": internal_margin,
+                            "drift_pct": drift_pct
+                        },
+                        "HIGH"
+                    )
+                    
+                    # In FULL_AUTO mode, consider emergency stop
+                    if self.safety.execution_mode == ExecutionMode.FULL_AUTO and drift_pct > 10.0:
+                        await self.safety.trigger_full_stop("MARGIN_MISMATCH_CRITICAL")
+                        
+        except Exception as e:
+            logger.error(f"Basic margin audit error: {e}")
 
     async def _execute_trading_cycle(self, cycle_counter: int):
         """
@@ -420,16 +604,15 @@ class ProductionTradingSupervisor:
             log_task.add_done_callback(self._background_tasks.discard)
 
     # ============================================================================
-    # HELPER METHODS
+    # HELPER METHODS (Preserved from original with minor enhancements)
     # ============================================================================
 
     async def _run_entry_logic(self, snapshot):
         """
-        Generate new entry orders based on VOLGUARD 4.1 BRAIN
+        Generate new entry orders based on VOLGUARD 5.0 HYBRID LOGIC
         """
         try:
             # 1. Fetch Option Chain & Contract Specs
-            # We use the trading engine's helper to get the best tradable chain
             if hasattr(self.engine, '_get_best_expiry_chain'):
                 expiry, chain = await self.engine._get_best_expiry_chain()
                 if not expiry or chain.empty:
@@ -439,60 +622,48 @@ class ProductionTradingSupervisor:
                 specs = registry.get_nifty_contract_specs(expiry)
                 lot_size = specs.get('lot_size', 50)
                 
-                # 2. RUN VOLGUARD 4.1 ANALYTICS
+                # 2. RUN VOLGUARD 5.0 ANALYTICS
                 
-                # A. External FII Data (New)
+                # A. External FII Data
                 ext_metrics = await self.participant_client.fetch_metrics()
                 
-                # B. Volatility (New 4.1 API)
-                # Calculates VoV Z-Score Kill Switch
+                # B. Volatility (VoV Z-Score Kill Switch)
                 vol = await self.vol_engine.analyze(
                     self.daily_data, 
-                    snapshot.get("vix", 0), # Pass vix_hist if available, else VIX live
+                    snapshot.get("vix", 0),
                     snapshot["spot"], 
                     snapshot["vix"]
                 )
                 
-                # C. Market Structure (New 4.1 API)
-                # Calculates Net GEX, Max Pain
+                # C. Market Structure (Net GEX, Max Pain)
                 struct = self.structure_engine.calculate_structure(chain, snapshot["spot"], lot_size)
                 
-                # D. Edge (New 4.1 API)
-                # Calculates Weighted VRP (70/15/15)
+                # D. Edge (Weighted VRP)
                 edge = self.edge_engine.calculate_edge(vol, chain, chain)
                 
-                # E. Regime Decision (New 4.1 API)
+                # E. Regime Decision
                 dte = (expiry - datetime.now().date()).days
                 
-                # Returns TradingMandate (Not old RegimeResult)
+                # Returns TradingMandate
                 mandate = self.regime_engine.analyze_regime(
                     vol, struct, edge, ext_metrics, "WEEKLY", dte
                 )
                 
-                # 3. COMPATIBILITY LAYER & EXECUTION
-                # The TradingEngine likely expects the old RegimeResult object.
-                # We can either update TradingEngine or use the mandate to drive decisions.
-                
-                logger.info(f"🧠 Analysis: {mandate.regime_name} | Score: {mandate.allocation_pct}% | FII: {ext_metrics.flow_regime}")
+                logger.info(f"🧠 VolGuard 5.0 Analysis: {mandate.regime_name} | "
+                           f"Score: {mandate.allocation_pct}% | "
+                           f"FII: {ext_metrics.flow_regime}")
 
-                # Stability Check (using mandate name)
+                # Stability Check
                 if self._is_regime_stable(mandate.regime_name):
                     
-                    # If Regime is CASH or allocation is 0, do nothing
                     if mandate.regime_name == "CASH" or mandate.allocation_pct <= 0:
                         return []
 
-                    # Convert Mandate to Order
-                    # We pass the mandate to the engine. Ensure engine handles it or we map it here.
-                    # Assuming engine.generate_entry_orders can handle the mandate 
-                    # OR we construct a compatible object.
-                    
-                    # For compatibility, we can inject a 'name' attribute if needed
-                    # mandate.name = mandate.regime_name 
-                    
+                    # NEW: TradingEngine now uses hybrid logic (Straddle Range + Delta Wings)
                     entries = await self.engine.generate_entry_orders(mandate, vol, snapshot)
                     if entries:
                         self.last_entry_time = time.time()
+                        logger.info(f"✅ Generated {len(entries)} entry orders using Hybrid Logic")
                         return entries
                         
         except Exception as e:
@@ -550,7 +721,6 @@ class ProductionTradingSupervisor:
     async def _read_live_snapshot(self) -> Dict:
         """
         Read live market snapshot with timeout protection
-        ENHANCED: Uses robust WebSocket health check
         """
         try:
             quotes_task = asyncio.create_task(
@@ -564,30 +734,21 @@ class ProductionTradingSupervisor:
             logger.error(f"Market data fetch failed: {e}")
             quotes = {NIFTY_KEY: 0.0, VIX_KEY: 0.0}
 
-        # ENHANCED: WebSocket Greeks with robust health validation
+        # WebSocket Greeks
         greeks = {}
         ws_healthy = False
         if self.ws:
             try:
-                # Use robust health check (checks connection + data freshness)
                 if self.ws.is_healthy():
                     ws_healthy = True
                     raw_greeks = self.ws.get_latest_greeks()
                     
-                    # Validate each Greeks entry
                     for key, val in raw_greeks.items():
-                        if isinstance(val, dict) and val:  # Ensure not empty
+                        if isinstance(val, dict) and val:
                             greeks[key] = val
                     
-                    # Diagnostic: Warn if WebSocket is healthy but no Greeks
                     if len(greeks) == 0 and len(raw_greeks) > 0:
                         logger.warning("WebSocket returned data but no valid Greeks")
-                else:
-                    # Diagnostic logging for unhealthy WebSocket
-                    if self.ws.is_connected:
-                        logger.debug("WebSocket connected but data is stale (>30s old)")
-                    else:
-                        pass # logger.debug("WebSocket not connected")
                         
             except Exception as e:
                 logger.debug(f"WebSocket Greeks fetch failed: {e}")
@@ -623,7 +784,6 @@ class ProductionTradingSupervisor:
     async def _update_positions(self, snapshot) -> Dict:
         """
         CRITICAL: Update positions with Greeks validation
-        Halts system if >30% positions have unreliable Greeks
         """
         async with self._position_update_lock:
             raw_list = await self.exec.get_positions()
@@ -633,7 +793,6 @@ class ProductionTradingSupervisor:
             for p in raw_list:
                 try:
                     if "greeks" not in p or not p["greeks"]:
-                        # Calculate Greeks manually
                         t = self._calculate_time_to_expiry(p.get("expiry"))
                         
                         calc = self.risk.calculate_leg_greeks(
@@ -647,7 +806,6 @@ class ProductionTradingSupervisor:
                         
                         if calc is None:
                             missing_greeks_count += 1
-                            # logger.error(f"⚠️ Cannot calculate Greeks for {p.get('instrument_key')}")
                             p["greeks"] = None
                             p["unsafe_greeks"] = True
                         else:
@@ -660,11 +818,11 @@ class ProductionTradingSupervisor:
                     logger.error(f"Position processing failed: {e}")
                     continue
             
-            # CRITICAL: Halt if too many unreliable Greeks
+            # Halt if too many unreliable Greeks
             if missing_greeks_count > 0 and len(pos_map) > 0:
                 reliability = 1 - (missing_greeks_count / len(pos_map))
                 
-                if reliability < 0.7:  # <70% reliability
+                if reliability < 0.7:
                     logger.critical(f"🛑 HALTING: Only {reliability*100:.1f}% Greeks reliable")
                     self.safety.system_state = SystemState.HALTED
                     await self.safety.record_failure(
@@ -677,7 +835,7 @@ class ProductionTradingSupervisor:
 
     async def _process_adjustment(self, adj, snapshot, cycle_id):
         """
-        Process adjustment with comprehensive error handling and margin learning
+        Process adjustment with comprehensive error handling
         """
         adj["cycle_id"] = cycle_id
         
@@ -688,7 +846,7 @@ class ProductionTradingSupervisor:
                 logger.debug(f"[{cycle_id}] Safety veto: {safe['reason']}")
                 return None
 
-            # 2. Capital Check (with margin learning)
+            # 2. Capital Check
             if adj.get("action") == "ENTRY":
                 margin_res = await self.cap_governor.can_trade_new([adj])
                 if not margin_res.allowed:
@@ -714,7 +872,6 @@ class ProductionTradingSupervisor:
                 if result.get("status") == "PLACED":
                     logger.info(f"[{cycle_id}] ✅ Order placed: {result.get('order_id')}")
                     
-                    # CRITICAL: Learn actual margin
                     if "required_margin" in result:
                         self.cap_governor.record_actual_margin(
                             result["required_margin"],
@@ -759,7 +916,6 @@ class ProductionTradingSupervisor:
                 logger.critical(msg)
                 if telegram_alerts.enabled:
                     await telegram_alerts.send_alert("Market Status", msg, "INFO")
-                # exit(0) # In production you might exit, but here we just return
                 return
         except Exception as e:
             logger.error(f"Holiday check failed: {e}")
@@ -770,9 +926,6 @@ class ProductionTradingSupervisor:
         
         if not (market_open <= now <= market_close):
             logger.warning(f"Started outside market hours ({now.strftime('%H:%M')})")
-            if self.safety.execution_mode in [ExecutionMode.SEMI_AUTO, ExecutionMode.FULL_AUTO]:
-                # logger.critical("Cannot start trading outside market hours")
-                pass
 
     def _check_kill_switch(self) -> bool:
         """
@@ -831,7 +984,6 @@ class ProductionTradingSupervisor:
                 side = 1 if p.get("side") == "BUY" else -1
                 delta = p.get("greeks", {}).get("delta", 0)
                 
-                # Futures have delta = 1.0
                 if "FUT" in str(p.get("symbol", "")):
                     delta = 1.0
                 
@@ -853,10 +1005,11 @@ class ProductionTradingSupervisor:
             "execution_mode": self.safety.execution_mode.value,
             "background_tasks_count": len(self._background_tasks),
             "last_heavy_refresh": self.last_heavy_refresh_date,
-            "portfolio_delta": self._calc_net_delta() if self.positions else 0.0
+            "portfolio_delta": self._calc_net_delta() if self.positions else 0.0,
+            "market_open_verified": self.market_open_verified,  # NEW
+            "token_validated": self.token_validated  # NEW
         }
         
-        # Add WebSocket stats if available
         if self.ws:
             try:
                 ws_stats = self.ws.get_stats()
