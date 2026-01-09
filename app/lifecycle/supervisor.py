@@ -1,3 +1,4 @@
+import aiohttp  
 import asyncio
 import time
 import logging
@@ -1045,3 +1046,4 @@ class ProductionTradingSupervisor:
         # Final state export
         set_system_state("STOPPED")
         logger.info("✅ Supervisor stopped gracefully")
+
